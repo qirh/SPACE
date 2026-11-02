@@ -1,4 +1,4 @@
-use pplx_space_common_core::types::OrgId;
+use pplx_space_common_core::types::{OrgId, SandboxId};
 
 use std::{collections::VecDeque, convert::Infallible, str::FromStr, time::Duration};
 
@@ -116,13 +116,12 @@ pub async fn stream_sandbox_lifecycle_events(
     let initial_events = store
         .fetch_sandbox_operation_events(
             org.id,
-            &sandbox_id.to_string(),
+            sandbox_id.into(),
             None,
             OPERATION_EVENT_STREAM_BATCH_LIMIT,
         )
         .await?;
-    let stream =
-        sandbox_lifecycle_event_stream(store, org.id, sandbox_id.to_string(), initial_events);
+    let stream = sandbox_lifecycle_event_stream(store, org.id, sandbox_id.into(), initial_events);
 
     Ok(Sse::new(stream)
         .keep_alive(KeepAlive::default())
@@ -333,7 +332,7 @@ async fn operation_has_terminal_state(
 struct SandboxLifecycleEventStreamState {
     store: PublicOperationStore,
     org_id: OrgId,
-    sandbox_id: String,
+    sandbox_id: SandboxId,
     cursor: Option<SandboxOperationEventCursor>,
     pending: VecDeque<PublicOperationEvent>,
     sleep_before_fetch: bool,
@@ -342,7 +341,7 @@ struct SandboxLifecycleEventStreamState {
 fn sandbox_lifecycle_event_stream(
     store: PublicOperationStore,
     org_id: OrgId,
-    sandbox_id: String,
+    sandbox_id: SandboxId,
     initial_events: Vec<PublicOperationEvent>,
 ) -> impl futures_core::Stream<Item = Result<Event, Infallible>> {
     let initial_len = initial_events.len();
@@ -372,7 +371,7 @@ fn sandbox_lifecycle_event_stream(
                 .store
                 .fetch_sandbox_operation_events(
                     state.org_id,
-                    &state.sandbox_id,
+                    state.sandbox_id,
                     state.cursor.as_ref(),
                     OPERATION_EVENT_STREAM_BATCH_LIMIT,
                 )
