@@ -2591,9 +2591,9 @@ impl Process for ExecutionService {
             pplx_space_spaced_guest_protocol::process_limits::MAX_MESSAGE_BYTES,
         )?;
         let request = request.into_inner();
-        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
         let signal =
             ProcessSignal::try_from_i32(request.signal).map_err(invalid_argument_status)?;
+        let process_id = ProcessId::parse(request.process_id).map_err(invalid_argument_status)?;
         let handle = self
             .inner
             .processes

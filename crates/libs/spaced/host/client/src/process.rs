@@ -1,6 +1,7 @@
 //! Process calls: start, reconnect, list, signals, input, PTY resize and kill.
 
 use super::*;
+use pplx_space_common_core::types::ProcessSignal;
 
 pub(super) const PROCESS_LIST_MAX_RECORDS: usize = 128;
 
