@@ -195,6 +195,8 @@ async fn run_service(
     // new attempt).
     let background_worker = service.background_worker();
     background_worker.recover_and_log("template-mgr.background_worker");
+    // Before the socket binds: nothing can own a staging or probe dir yet.
+    service.clean_transient_dirs_before_serving();
 
     let listener = pplx_space_common_svc::bind_unix_socket(
         &config.socket_path,

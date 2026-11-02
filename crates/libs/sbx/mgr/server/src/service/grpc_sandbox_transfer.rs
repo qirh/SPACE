@@ -153,22 +153,76 @@ fn validate_import_sandbox_header(
     })
 }
 
-fn ensure_delta_template_available(
-    header: &crate::proto::ImportSandboxHeader,
-) -> Result<(), Status> {
-    if header.is_delta && !header.template_id.is_empty() && !header.content_hash.is_empty() {
-        let template_dir = pplx_space_common_core::host::linux::paths::template_build_dir(
-            &header.template_id,
-            &header.content_hash,
-        );
-        if !std::path::Path::new(&template_dir).is_dir() {
-            return Err(Status::failed_precondition(format!(
-                "delta import requires template '{}' with hash '{}' on this node. Pull the template first, or use full transfer.",
-                header.template_id, header.content_hash
-            )));
+/// The rootfs of a ready build of `template@content_hash` on this node, the
+/// only safe base for a rootfs delta. Every cache partition of one digest
+/// holds the same rootfs bytes, but only template-manager's catalog says a
+/// build dir holds them in full: a dir can exist without a row, as a
+/// transient recovery failure leaves it, or partly written. So the base comes
+/// from a `cached_only` lookup, which answers from a ready row and never
+/// pulls. `None` when there's no such build or template-manager can't answer;
+/// the caller then transfers the full rootfs, or refuses a delta import.
+pub(super) async fn verified_template_rootfs(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    template: &str,
+    content_hash: &str,
+) -> Option<std::path::PathBuf> {
+    if template.is_empty() || content_hash.is_empty() {
+        return None;
+    }
+    let mut request =
+        tonic::Request::new(pplx_space_template_mgr_client::proto::GetTemplateRequest {
+            template: Some(pplx_space_template_mgr_client::proto::TemplateRef {
+                name: template.to_string(),
+                content_hash: Some(content_hash.to_string()),
+                tag: None,
+                environment: None,
+            }),
+            vcpu: None,
+            memory_mib: None,
+            caller_org_id: None,
+            cached_only: true,
+        });
+    pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution
+        .attach(&mut request);
+    match templates.get_template(request).await {
+        Ok(response) => {
+            let rootfs = std::path::Path::new(&response.into_inner().template_dir)
+                .join(pplx_space_common_core::types::TEMPLATE_ROOTFS_FILE);
+            rootfs.is_file().then_some(rootfs)
+        }
+        Err(crate::template_resolver::TemplateLookupError::Rpc(status))
+            if status.code() == tonic::Code::NotFound =>
+        {
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                template,
+                content_hash,
+                %error,
+                "no verified delta base: template lookup failed"
+            );
+            None
         }
     }
-    Ok(())
+}
+
+async fn delta_import_base(
+    templates: &dyn crate::template_resolver::TemplateResolver,
+    header: &crate::proto::ImportSandboxHeader,
+) -> Result<Option<std::path::PathBuf>, Status> {
+    if !header.is_delta {
+        return Ok(None);
+    }
+    verified_template_rootfs(templates, &header.template_id, &header.content_hash)
+        .await
+        .map(Some)
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "delta import requires template '{}' with hash '{}' on this node. Pull the template first, or use full transfer.",
+                header.template_id, header.content_hash
+            ))
+        })
 }
 
 pub(super) mod receive;
@@ -239,12 +293,12 @@ async fn receive_sandbox_import_body(
 
 async fn apply_sandbox_delta_import(
     service: &SandboxManagerService,
-    header: &crate::proto::ImportSandboxHeader,
+    delta_base: Option<std::path::PathBuf>,
     paths: &SandboxImportPaths,
 ) -> Result<(), Status> {
-    if !header.is_delta {
+    let Some(template_rootfs) = delta_base else {
         return Ok(());
-    }
+    };
 
     let diff_file = format!("{}/rootfs.ext4.diff", paths.instance_staging);
     if !std::path::Path::new(&diff_file).exists() {
@@ -254,15 +308,11 @@ async fn apply_sandbox_delta_import(
     }
 
     let dest_file = format!("{}/rootfs.ext4", paths.instance_staging);
-    let template_rootfs = pplx_space_common_core::host::linux::paths::template_rootfs_path(
-        &header.template_id,
-        &header.content_hash,
-    );
     let diff_file_for_apply = diff_file.clone();
     service
         .blocking_artifact_io(move |_| {
             pplx_space_node_runtime_core::file_delta::apply_diff_with_limit(
-                std::path::Path::new(&template_rootfs),
+                &template_rootfs,
                 std::path::Path::new(&diff_file_for_apply),
                 std::path::Path::new(&dest_file),
                 pplx_space_common_core::sandbox_storage::MAX_SANDBOX_ROOTFS_BYTES,
@@ -423,7 +473,12 @@ impl SandboxManagerService {
         let guest_uptime_secs = sandbox.guest_uptime_secs;
         let process_env = sandbox.process_env.clone();
         let rootfs_size_mb = sandbox.rootfs_size_mb;
-        let use_delta = req.use_delta;
+        let delta_base = if req.use_delta {
+            verified_template_rootfs(self.template_resolver.as_ref(), &template, &template_hash)
+                .await
+        } else {
+            None
+        };
         let include_snapshot = sandbox.state == SandboxState::Suspended;
         let writer = self.state_writer_lease("ExportSandbox")?;
         let lease = sandbox
@@ -475,21 +530,15 @@ impl SandboxManagerService {
                                     }
                                 }
                             }
-                            let template_rootfs =
-                                pplx_space_common_core::host::linux::paths::template_rootfs_path(
-                                    &template,
-                                    &template_hash,
-                                );
-                            let can_delta = use_delta
-                                && std::path::Path::new(&template_rootfs).exists()
-                                && std::path::Path::new(&sandbox_rootfs).exists();
+                            let delta_base = delta_base
+                                .filter(|_| std::path::Path::new(&sandbox_rootfs).exists());
 
                             // If delta is possible, compute it to a temp file
-                            let (diff_path, is_delta) = if can_delta {
+                            let (diff_path, is_delta) = if let Some(template_rootfs) = delta_base {
                                 let diff_id = uuid::Uuid::now_v7();
                                 let diff = format!("{instance_dir}/../.rootfs.diff.{diff_id}.tmp");
                                 match pplx_space_node_runtime_core::file_delta::compute_diff(
-                                    std::path::Path::new(&template_rootfs),
+                                    &template_rootfs,
                                     std::path::Path::new(&sandbox_rootfs),
                                     std::path::Path::new(&diff),
                                 ) {
@@ -778,7 +827,7 @@ impl SandboxManagerService {
         };
         self.reject_existing_sandbox_import(validated.sandbox_id)
             .await?;
-        ensure_delta_template_available(&header)?;
+        let delta_base = delta_import_base(self.template_resolver.as_ref(), &header).await?;
 
         let paths = SandboxImportPaths::new(&sandbox_id);
         let cleanup_id = SandboxCleanupEpisodeId::new();
@@ -813,7 +862,7 @@ impl SandboxManagerService {
         .await?;
         let has_suspend_snapshot =
             receive_sandbox_import_body(&mut stream, &paths, header.is_delta, deadline).await?;
-        apply_sandbox_delta_import(self, &header, &paths).await?;
+        apply_sandbox_delta_import(self, delta_base, &paths).await?;
         publish_imported_instance(self, &paths).await?;
         publish_imported_snapshot(&paths, has_suspend_snapshot).await?;
         write_imported_sandbox_metadata(&sandbox_id, &header, validated.execution).await?;

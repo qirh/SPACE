@@ -484,3 +484,76 @@ async fn import_identity_normalization_and_existing_owner_detection_agree() {
         assert!(validate_import_sandbox_header(&header).is_err());
     }
 }
+
+/// A delta base is the rootfs of the build template-manager's catalog
+/// answers for, never a sibling build dir that merely exists. Here a rowless
+/// partial legacy dir sits next to the verified twin the lookup returns. With
+/// no verified build, an export falls back to a full rootfs and a delta
+/// import is refused.
+#[tokio::test]
+async fn a_delta_base_is_the_catalog_s_verified_build_or_none() {
+    use crate::template_resolver::{TemplateLookupError, fake::FakeTemplateResolver};
+    use pplx_space_template_mgr_client::proto::{GetTemplateResponse, TemplateRef};
+
+    let hash = format!("sha256:{}", "a".repeat(64));
+    let root = tempfile::tempdir().unwrap();
+    let legacy = root.path().join("seed").join(&hash);
+    let twin = root
+        .path()
+        .join("seed")
+        .join(format!("{hash}@sha256:{}", "b".repeat(64)));
+    for (dir, bytes) in [(&legacy, &b"partial"[..]), (&twin, &b"verified"[..])] {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("rootfs.ext4"), bytes).unwrap();
+    }
+    let answer_dir = twin.to_string_lossy().into_owned();
+    let answer_hash = hash.clone();
+    let verified = FakeTemplateResolver::new(move || {
+        Ok(tonic::Response::new(GetTemplateResponse {
+            template: Some(TemplateRef {
+                name: "seed".into(),
+                content_hash: Some(answer_hash.clone()),
+                tag: None,
+                environment: None,
+            }),
+            template_dir: answer_dir.clone(),
+            ..Default::default()
+        }))
+    });
+
+    assert_eq!(
+        verified_template_rootfs(&verified, "seed", &hash).await,
+        Some(twin.join("rootfs.ext4"))
+    );
+    let [request] = verified.requests().try_into().unwrap();
+    assert!(request.cached_only);
+    assert_eq!(request.caller_org_id, None);
+    let template = request.template.unwrap();
+    assert_eq!(template.name, "seed");
+    assert_eq!(template.content_hash.as_deref(), Some(hash.as_str()));
+
+    let header = crate::proto::ImportSandboxHeader {
+        is_delta: true,
+        template_id: "seed".into(),
+        content_hash: hash.clone(),
+        ..Default::default()
+    };
+    for unverified in [
+        FakeTemplateResolver::refusing(tonic::Status::not_found("no ready build")),
+        FakeTemplateResolver::refusing(tonic::Status::unavailable("template-manager down")),
+        FakeTemplateResolver::new(|| Err(TemplateLookupError::Rpc(tonic::Status::internal("db")))),
+    ] {
+        assert_eq!(
+            verified_template_rootfs(&unverified, "seed", &hash).await,
+            None
+        );
+        let status = delta_import_base(&unverified, &header).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition, "{status}");
+    }
+    assert_eq!(
+        delta_import_base(&verified, &crate::proto::ImportSandboxHeader::default())
+            .await
+            .unwrap(),
+        None
+    );
+}

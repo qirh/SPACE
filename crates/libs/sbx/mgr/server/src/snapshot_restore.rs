@@ -2805,9 +2805,11 @@ async fn ensure_local_template(
                     name: template_name.to_string(),
                     content_hash: Some(content_hash.to_string()),
                     tag: None,
+                    environment: None,
                 }),
                 vcpu: None,
                 memory_mib: None,
+                cached_only: false,
             });
         let scope = crate::service::template_lookup_scope(owner, Some(sandbox_id))
             .map_err(|error| RestoreError::Other(error.to_string()))?;

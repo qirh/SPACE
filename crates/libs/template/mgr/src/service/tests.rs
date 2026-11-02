@@ -9,6 +9,8 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 mod export;
 mod lookup_rpc;
+mod partitions;
+mod register_race;
 mod schema_guards;
 
 #[tokio::test(flavor = "current_thread")]
@@ -37,6 +39,7 @@ fn build_row(name: &str, content_hash: &str) -> crate::db::BuildRow {
     crate::db::BuildRow {
         name: name.to_string(),
         content_hash: content_hash.to_string(),
+        cache_partition: crate::db::TemplateCachePartition::Legacy,
         build_date: "2026-05-13T00:00:00Z".to_string(),
         manifest_json: "{}".to_string(),
         runtime: RUNTIME_FIRECRACKER_ALIAS.to_string(),
@@ -55,6 +58,7 @@ fn insert_ready_build(conn: &rusqlite::Connection, name: &str, content_hash: &st
         &crate::db::BuildUpsert {
             name,
             content_hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-05-13T00:00:00Z",
             manifest_json: "{}",
             runtime: RUNTIME_FIRECRACKER_ALIAS,
@@ -348,6 +352,7 @@ fn list_templates_projects_stored_execution_metadata() {
         &crate::db::BuildUpsert {
             name: "seed",
             content_hash: "sha256:execution-test",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-05-13T00:00:00Z",
             manifest_json: &manifest.to_string(),
             runtime: RUNTIME_FIRECRACKER_ALIAS,
@@ -886,6 +891,7 @@ fn delete_template_build_rejects_traversal_hash_before_delete() {
         &crate::db::BuildUpsert {
             name: template,
             content_hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-05-13T00:00:00Z",
             manifest_json: "{}",
             runtime: RUNTIME_FIRECRACKER_ALIAS,
@@ -908,6 +914,7 @@ fn delete_template_build_rejects_traversal_hash_before_delete() {
                     name: template.to_string(),
                     content_hash: Some(content_hash.to_string()),
                     tag: None,
+                    environment: None,
                 }),
             },
         )))
@@ -916,9 +923,14 @@ fn delete_template_build_rejects_traversal_hash_before_delete() {
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_some()
+        crate::db::get_build(
+            &conn,
+            template,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_some()
     );
 }
 
@@ -947,9 +959,14 @@ fn delete_template_build_preserves_db_row_when_artifact_removal_fails() {
     assert_eq!(error.code(), tonic::Code::Internal);
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_some(),
+        crate::db::get_build(
+            &conn,
+            template,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_some(),
         "build row must remain when artifact deletion fails"
     );
 }
@@ -1133,9 +1150,14 @@ fn delete_template_build_removes_read_only_btrfs_subvolume_build() {
     );
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &conn,
+            template,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "build row must be cleaned up after disk removal"
     );
 }
@@ -1183,9 +1205,14 @@ fn delete_template_removes_read_only_btrfs_subvolume_builds() {
     );
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &conn,
+            template,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "build rows must be cleaned up after disk removal"
     );
 }
@@ -1240,9 +1267,14 @@ fn delete_template_build_preserves_db_row_when_subvolume_removal_fails() {
     );
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_some(),
+        crate::db::get_build(
+            &conn,
+            template,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_some(),
         "build row must remain when subvolume deletion fails"
     );
 }
@@ -1265,9 +1297,14 @@ fn stale_build_row_after_disk_first_crash_is_pruned_by_recovery_cleanup() {
 
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, template, content_hash)
-            .unwrap()
-            .is_none(),
+        crate::db::get_build(
+            &conn,
+            template,
+            content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_none(),
         "recovery cleanup must prune DB rows for disk-removed builds"
     );
 }
@@ -1314,6 +1351,7 @@ fn local_lookup_rejects_stored_traversal_hash_before_path_lookup() {
         &crate::db::BuildUpsert {
             name: template,
             content_hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-05-13T00:00:00Z",
             manifest_json: "{}",
             runtime: RUNTIME_FIRECRACKER_ALIAS,
@@ -1323,9 +1361,10 @@ fn local_lookup_rejects_stored_traversal_hash_before_path_lookup() {
         },
     )
     .unwrap();
-    let error = TemplateManagerService::resolve_template(&conn, template, "", "").expect_err(
-        "stored invalid content hash must reject local lookup before filesystem lookup",
-    );
+    let error = TemplateManagerService::resolve_template_build(&conn, template, "", None)
+        .expect_err(
+            "stored invalid content hash must reject local lookup before filesystem lookup",
+        );
 
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
@@ -1386,7 +1425,13 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
         hash_b,
     } = cached_base_fixture;
     if cold {
-        crate::db::delete_build(&service.db.lock().unwrap(), "base", &hash_a).unwrap();
+        crate::db::delete_build(
+            &service.db.lock().unwrap(),
+            "base",
+            &hash_a,
+            crate::db::TemplateCachePartition::Legacy,
+        )
+        .unwrap();
     }
     let materialized = std::cell::Cell::new(false);
     let request = |hash: Option<String>, tag: Option<&str>| {
@@ -1395,10 +1440,12 @@ async fn get_template_authorizes_and_resolves_before_using_cached_builds(
                 name: "base".into(),
                 content_hash: hash,
                 tag: tag.map(str::to_owned),
+                environment: None,
             }),
             caller_org_id: Some(org.to_string()),
             vcpu: Some(1),
             memory_mib: Some(512),
+            cached_only: false,
         })
     };
 
@@ -1542,6 +1589,7 @@ fn reconcile_desired_base_snapshot_ignores_unset_policy() {
         &crate::db::BuildUpsert {
             name: "codex-unset-base-snapshot-test",
             content_hash: "sha256:unset-policy-test",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-04-29T00:00:00Z",
             manifest_json: "{}",
             runtime: RUNTIME_FIRECRACKER_ALIAS,
@@ -1553,10 +1601,13 @@ fn reconcile_desired_base_snapshot_ignores_unset_policy() {
     .unwrap();
     crate::db::upsert_snapshot(
         &conn,
-        "codex-unset-base-snapshot-test",
-        "sha256:unset-policy-test",
-        2,
-        1024,
+        crate::db::SnapshotKey {
+            name: "codex-unset-base-snapshot-test",
+            content_hash: "sha256:unset-policy-test",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
+            vcpu: 2,
+            memory_mib: 1024,
+        },
         "snapshot-hash",
     )
     .unwrap();
@@ -1580,6 +1631,7 @@ fn reconcile_desired_base_snapshot_ignores_unset_policy() {
         &conn,
         "codex-unset-base-snapshot-test",
         "sha256:unset-policy-test",
+        crate::db::TemplateCachePartition::Legacy,
     )
     .unwrap();
     assert_eq!(snapshots.len(), 1);
@@ -1595,6 +1647,7 @@ fn prune_base_snapshots_except_keeps_old_build_snapshots() {
             &crate::db::BuildUpsert {
                 name: template,
                 content_hash,
+                cache_partition: crate::db::TemplateCachePartition::Legacy,
                 build_date: "2026-04-29T00:00:00Z",
                 manifest_json: "{}",
                 runtime: RUNTIME_FIRECRACKER_ALIAS,
@@ -1605,10 +1658,42 @@ fn prune_base_snapshots_except_keeps_old_build_snapshots() {
         )
         .unwrap();
     }
-    crate::db::upsert_snapshot(&conn, template, "sha256:old-prune-test", 2, 1024, "old").unwrap();
-    crate::db::upsert_snapshot(&conn, template, "sha256:new-prune-test", 2, 1024, "stale").unwrap();
-    crate::db::upsert_snapshot(&conn, template, "sha256:new-prune-test", 2, 2048, "desired")
-        .unwrap();
+    crate::db::upsert_snapshot(
+        &conn,
+        crate::db::SnapshotKey {
+            name: template,
+            content_hash: "sha256:old-prune-test",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
+            vcpu: 2,
+            memory_mib: 1024,
+        },
+        "old",
+    )
+    .unwrap();
+    crate::db::upsert_snapshot(
+        &conn,
+        crate::db::SnapshotKey {
+            name: template,
+            content_hash: "sha256:new-prune-test",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
+            vcpu: 2,
+            memory_mib: 1024,
+        },
+        "stale",
+    )
+    .unwrap();
+    crate::db::upsert_snapshot(
+        &conn,
+        crate::db::SnapshotKey {
+            name: template,
+            content_hash: "sha256:new-prune-test",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
+            vcpu: 2,
+            memory_mib: 2048,
+        },
+        "desired",
+    )
+    .unwrap();
     let service = TemplateManagerService::new(conn).unwrap();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1620,6 +1705,7 @@ fn prune_base_snapshots_except_keeps_old_build_snapshots() {
             template,
             template,
             "sha256:new-prune-test",
+            crate::db::TemplateCachePartition::Legacy,
             2,
             2048,
         ))
@@ -1627,10 +1713,20 @@ fn prune_base_snapshots_except_keeps_old_build_snapshots() {
 
     assert!(pruned);
     let conn = service.db.lock().unwrap();
-    let old_snapshots =
-        crate::db::list_snapshots(&conn, template, "sha256:old-prune-test").unwrap();
-    let new_snapshots =
-        crate::db::list_snapshots(&conn, template, "sha256:new-prune-test").unwrap();
+    let old_snapshots = crate::db::list_snapshots(
+        &conn,
+        template,
+        "sha256:old-prune-test",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
+    let new_snapshots = crate::db::list_snapshots(
+        &conn,
+        template,
+        "sha256:new-prune-test",
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
     assert_eq!(old_snapshots.len(), 1);
     assert_eq!(old_snapshots[0].memory_mib, 1024);
     assert_eq!(new_snapshots.len(), 1);
@@ -1771,9 +1867,14 @@ async fn refresh_register_existing_expanded_build_preserves_rootfs_bytes(
         manifest_bytes
     );
     let conn = service.db.lock().unwrap();
-    let build = crate::db::get_build(&conn, "register-refresh-test", &content_hash)
-        .unwrap()
-        .expect("build row should exist after refresh");
+    let build = crate::db::get_build(
+        &conn,
+        "register-refresh-test",
+        &content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap()
+    .expect("build row should exist after refresh");
     assert_eq!(build.content_hash, content_hash);
     assert_eq!(build.artifact_size_bytes, original_bytes.len() as u64);
 }
@@ -1839,7 +1940,8 @@ async fn register_refresh_cannot_add_remove_or_replace_a_retained_binding() {
             crate::db::get_build(
                 &service.db.lock().unwrap(),
                 "register-refresh-test",
-                &content_hash
+                &content_hash,
+                crate::db::TemplateCachePartition::Legacy,
             )
             .unwrap()
             .is_none()
@@ -1906,7 +2008,7 @@ fn rootfs_size_mb_from_metadata_returns_none_for_template_without_disk_size() {
     assert_eq!(result, None);
 }
 
-/// `resolve_template` is the chokepoint every `GetTemplate` /
+/// `resolve_template_build` is the chokepoint every `GetTemplate` /
 /// `FindTemplateBuild` flow goes through. A successful resolve
 /// must advance `last_used_at` on the matched build so the LRU
 /// eviction loop sees real usage. Without this wiring,
@@ -1924,6 +2026,7 @@ fn resolve_template_advances_last_used_at_on_both_paths() {
         &BuildUpsert {
             name: "seed",
             content_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -1942,13 +2045,14 @@ fn resolve_template_advances_last_used_at_on_both_paths() {
         1_000,
     )
     .unwrap();
-    let (name, hash) = TemplateManagerService::resolve_template(
+    let build = TemplateManagerService::resolve_template_build(
         &conn,
         "seed",
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "",
+        None,
     )
     .unwrap();
+    let (name, hash) = (build.name, build.content_hash);
     assert_eq!(
         (name.as_str(), hash.as_str()),
         (
@@ -1982,7 +2086,7 @@ fn resolve_template_advances_last_used_at_on_both_paths() {
         1_000,
     )
     .unwrap();
-    let _ = TemplateManagerService::resolve_template(&conn, "seed", "", "").unwrap();
+    let _ = TemplateManagerService::resolve_template_build(&conn, "seed", "", None).unwrap();
     let after_latest: u64 = conn
         .query_row(
             "SELECT last_used_at FROM template_builds WHERE name = ?1 AND content_hash = ?2",
@@ -2005,7 +2109,7 @@ fn resolve_template_advances_last_used_at_on_both_paths() {
 /// Regression test for the GC-vs-sandbox-create race:
 /// a build that the eviction loop has marked
 /// `state='deleting'` (Phase 1 of `execute_one_async`) must
-/// NOT be returned by `resolve_template` to a concurrent
+/// NOT be returned by `resolve_template_build` to a concurrent
 /// sandbox-create. Without this filter the caller would get
 /// the hash of a build that's about to vanish, and the
 /// sandbox would boot against a missing rootfs.
@@ -2021,6 +2125,7 @@ fn resolve_template_filters_out_deleting_state_rows() {
         &BuildUpsert {
             name: "seed",
             content_hash: hash,
+            cache_partition: crate::db::TemplateCachePartition::Legacy,
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: "{}",
             runtime: "fc",
@@ -2031,7 +2136,7 @@ fn resolve_template_filters_out_deleting_state_rows() {
     )
     .unwrap();
     // Resolution works when ready.
-    let _ = TemplateManagerService::resolve_template(&conn, "seed", hash, "").unwrap();
+    let _ = TemplateManagerService::resolve_template_build(&conn, "seed", hash, None).unwrap();
 
     // Eviction Phase 1 flips state.
     conn.execute(
@@ -2042,17 +2147,18 @@ fn resolve_template_filters_out_deleting_state_rows() {
     .unwrap();
 
     // Resolution now refuses to hand out a doomed build.
-    let err = TemplateManagerService::resolve_template(&conn, "seed", hash, "").unwrap_err();
+    let err =
+        TemplateManagerService::resolve_template_build(&conn, "seed", hash, None).unwrap_err();
     assert_eq!(
         err.code(),
         tonic::Code::NotFound,
-        "resolve_template must treat state='deleting' as not-resolvable, got {err:?}",
+        "resolve_template_build must treat state='deleting' as not-resolvable, got {err:?}",
     );
 
     // Latest-build path (empty content_hash) also filters
     // 'deleting' rows because `get_latest_build` already has
     // `WHERE state = 'ready'`.
-    let err = TemplateManagerService::resolve_template(&conn, "seed", "", "").unwrap_err();
+    let err = TemplateManagerService::resolve_template_build(&conn, "seed", "", None).unwrap_err();
     assert_eq!(err.code(), tonic::Code::NotFound);
 }
 
@@ -2158,8 +2264,13 @@ fn fallback_delete_build_artifacts_removes_plain_digest_dir() {
     assert!(digest_dir.exists());
 
     let store = super::TemplateArtifactStore::new(temp.path());
-    super::fallback_delete_build_artifacts(&store, template, content_hash)
-        .expect("plain-dir fallback delete must succeed");
+    super::fallback_delete_build_artifacts(
+        &store,
+        template,
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .expect("plain-dir fallback delete must succeed");
 
     assert!(
         !digest_dir.exists(),
@@ -2193,7 +2304,13 @@ fn fallback_delete_build_artifacts_removes_snapshot_dirs() {
     assert!(snapshot_dir.exists());
 
     let store = super::TemplateArtifactStore::new(temp.path());
-    super::fallback_delete_build_artifacts(&store, template, content_hash).unwrap();
+    super::fallback_delete_build_artifacts(
+        &store,
+        template,
+        content_hash,
+        crate::db::TemplateCachePartition::Legacy,
+    )
+    .unwrap();
 
     assert!(!digest_dir.exists(), "digest dir must be gone");
     assert!(
@@ -2213,6 +2330,7 @@ fn fallback_delete_build_artifacts_is_idempotent() {
         &store,
         "nonexistent",
         "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        crate::db::TemplateCachePartition::Legacy,
     )
     .expect("fallback on a non-existent digest dir must be a no-op success");
 }
@@ -2305,17 +2423,22 @@ fn finish_register_with_existing_digest_preserves_staging_for_retry() {
         .build()
         .unwrap();
     let response = runtime
-        .block_on(service.finish_register_with_existing_digest(
-            templates::ExistingDigestRegistration {
+        .block_on(
+            service.finish_register_with_existing_digest(templates::ExistingDigestRegistration {
                 template_id: "register-refresh-test",
                 content_hash: &content_hash,
+                partition: crate::db::TemplateCachePartition::Legacy,
                 digest_dir: &digest_dir,
                 metadata_bytes: Some(br#"{"disk_size_mb":4}"#),
                 requested_network_policy: None,
                 publish_node_state: false,
                 register_source: &source,
-            },
-        ))
+                claim: service
+                    .volume_puller
+                    .try_claim_digest("register-refresh-test", &content_hash)
+                    .unwrap(),
+            }),
+        )
         .expect("registration must converge on the existing digest")
         .into_inner();
 
@@ -2330,9 +2453,14 @@ fn finish_register_with_existing_digest_preserves_staging_for_retry() {
     );
     let conn = service.db.lock().unwrap();
     assert!(
-        crate::db::get_build(&conn, "register-refresh-test", &content_hash)
-            .unwrap()
-            .is_some()
+        crate::db::get_build(
+            &conn,
+            "register-refresh-test",
+            &content_hash,
+            crate::db::TemplateCachePartition::Legacy
+        )
+        .unwrap()
+        .is_some()
     );
 }
 
@@ -2409,6 +2537,9 @@ async fn register_template_uses_producer_algorithm(
     for file in [TEMPLATE_ROOTFS_FILE, "metadata.json"] {
         std::fs::copy(fixture.path().join(file), source.join(file)).unwrap();
     }
+    // A Cloud Hypervisor build is bound to its environment and lands in that
+    // environment's cache partition.
+    let mut partition = crate::db::TemplateCachePartition::Legacy;
     if cloud_hypervisor {
         use pplx_space_common_core::types::{Arch, TemplateMetadata};
         let environments =
@@ -2428,6 +2559,9 @@ async fn register_template_uses_producer_algorithm(
                 .unwrap(),
         );
         metadata.arch = Some("x86_64".into());
+        partition = pplx_space_node_runtime_core::catalog::template_cache_partition(
+            metadata.environment().unwrap(),
+        );
         std::fs::write(
             source.join("metadata.json"),
             serde_json::to_vec(&metadata).unwrap(),
@@ -2460,7 +2594,10 @@ async fn register_template_uses_producer_algorithm(
         .unwrap()
         .into_inner();
     let observed = response.template.unwrap().content_hash.unwrap();
-    let published = root.path().join(name).join(&observed);
+    let published = root
+        .path()
+        .join(name)
+        .join(partition.build_dir_name(&observed));
     // Registration schedules compression; keep its task-owned directory until it finishes.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while rootfs_zstd_generation_inflight()
@@ -2481,7 +2618,7 @@ async fn register_template_uses_producer_algorithm(
     let manifest: pplx_space_common_core::types::TemplateManifest =
         serde_json::from_slice(&std::fs::read(published.join("manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest.content_hash, expected);
-    let build = crate::db::get_build(&service.db.lock().unwrap(), name, &expected)
+    let build = crate::db::get_build(&service.db.lock().unwrap(), name, &expected, partition)
         .unwrap()
         .expect("registered identity must be persisted");
     assert_eq!(build.content_hash, expected);
@@ -2519,6 +2656,9 @@ async fn firmware_template_refuses_pool_and_snapshot_intent_before_persisting() 
         &crate::db::BuildUpsert {
             name: "firmware-test",
             content_hash: &hash,
+            cache_partition: pplx_space_node_runtime_core::catalog::template_cache_partition(
+                manifest.environment().unwrap(),
+            ),
             build_date: "2026-01-01T00:00:00Z",
             manifest_json: &serde_json::to_string(&manifest).unwrap(),
             runtime: "ch",

@@ -168,9 +168,11 @@ async fn probe_cached_template(
                 name: pull.template_id.clone(),
                 content_hash: Some(hash.to_owned()),
                 tag: None,
+                environment: None,
             }),
             vcpu: pull.snapshot_vcpu,
             memory_mib: pull.snapshot_memory_mib,
+            cached_only: false,
         });
     scope.attach(&mut request);
     let Ok(response) = pplx_space_common_grpc::fwd_retry!(
@@ -272,6 +274,7 @@ pub async fn pull_template(
             name: template_id.clone(),
             content_hash: req.content_hash.clone(),
             tag: req.tag.clone(),
+            environment: None,
         }),
         include_snapshot: false,
         snapshot_vcpu: None,
@@ -381,6 +384,7 @@ pub async fn pull_template(
                         name: template_id.clone(),
                         content_hash: Some(export_content_hash.to_string()),
                         tag: None,
+                        environment: None,
                     }),
                     metadata_json: export_header.metadata_json,
                     include_snapshot: false,

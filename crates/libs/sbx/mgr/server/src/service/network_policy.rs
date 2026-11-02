@@ -140,9 +140,11 @@ pub(crate) async fn fetch_template_default_network_policy(
                 name: template.to_string(),
                 content_hash: None,
                 tag: None,
+                environment: None,
             }),
             vcpu: None,
             memory_mib: None,
+            cached_only: false,
         });
     let scope = pplx_space_common_svc::template_lookup::TemplateLookupScope::LocalExecution;
     scope.attach(&mut request);

@@ -130,7 +130,16 @@ impl SandboxManagerService {
             Status::failed_precondition("sandbox has no pinned template content hash")
         })?;
         let include_rootfs = req.include_rootfs;
-        let use_delta = req.use_delta;
+        let delta_base = if include_rootfs && req.use_delta {
+            super::grpc_sandbox_transfer::verified_template_rootfs(
+                self.template_resolver.as_ref(),
+                &template,
+                &template_hash,
+            )
+            .await
+        } else {
+            None
+        };
         let writer = self.state_writer_lease("ExportSnapshot")?;
         let snapshot_key = snapshot_name
             .parse::<pplx_space_common_core::types::SnapshotName>()
@@ -223,32 +232,23 @@ impl SandboxManagerService {
                                     return;
                                 }
 
-                                if use_delta && std::path::Path::new(&rootfs_path).exists() {
-                                    let template_rootfs =
-                        pplx_space_common_core::host::linux::paths::template_rootfs_path(
-                            &template,
-                            &template_hash,
-                        );
-                                    if std::path::Path::new(&template_rootfs).exists() {
-                                        let diff_id = uuid::Uuid::now_v7();
-                                        let diff_path =
-                                            format!("{snapshot_dir}/.rootfs.diff.{diff_id}.tmp");
-                                        _rootfs_diff_guard = DiffCleanup(Some(diff_path.clone()));
-                                        if pplx_space_node_runtime_core::file_delta::compute_diff(
-                                            std::path::Path::new(&template_rootfs),
-                                            std::path::Path::new(&rootfs_path),
-                                            std::path::Path::new(&diff_path),
-                                        )
-                                        .is_ok()
-                                        {
-                                            files.push(("rootfs.ext4.diff", diff_path, true));
-                                        } else {
-                                            files.push(("rootfs.ext4", rootfs_path, true));
-                                        }
+                                if let Some(template_rootfs) = delta_base {
+                                    let diff_id = uuid::Uuid::now_v7();
+                                    let diff_path =
+                                        format!("{snapshot_dir}/.rootfs.diff.{diff_id}.tmp");
+                                    _rootfs_diff_guard = DiffCleanup(Some(diff_path.clone()));
+                                    if pplx_space_node_runtime_core::file_delta::compute_diff(
+                                        &template_rootfs,
+                                        std::path::Path::new(&rootfs_path),
+                                        std::path::Path::new(&diff_path),
+                                    )
+                                    .is_ok()
+                                    {
+                                        files.push(("rootfs.ext4.diff", diff_path, true));
                                     } else {
                                         files.push(("rootfs.ext4", rootfs_path, true));
                                     }
-                                } else if std::path::Path::new(&rootfs_path).exists() {
+                                } else {
                                     files.push(("rootfs.ext4", rootfs_path, true));
                                 }
                             }
@@ -473,15 +473,23 @@ impl SandboxManagerService {
                 }
             }
             if receiver.contains("rootfs.ext4.diff") {
-                let template = pplx_space_common_core::host::linux::paths::template_rootfs_path(
+                let template = super::grpc_sandbox_transfer::verified_template_rootfs(
+                    self.template_resolver.as_ref(),
                     &header.template_id,
                     &header.content_hash,
-                );
+                )
+                .await
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "delta import requires template '{}' with hash '{}' on this node. Pull the template first, or use full transfer.",
+                        header.template_id, header.content_hash
+                    ))
+                })?;
                 let diff = format!("{staging}/rootfs.ext4.diff");
                 let dest = format!("{staging}/rootfs.ext4");
                 self.blocking_artifact_io(move |_| {
                     pplx_space_node_runtime_core::file_delta::apply_diff_with_limit(
-                        std::path::Path::new(&template),
+                        &template,
                         std::path::Path::new(&diff),
                         std::path::Path::new(&dest),
                         receive::MAX_TRANSFER_FILE_BYTES,
