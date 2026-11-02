@@ -100,6 +100,7 @@ use sqlx::types::JsonValue;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+pub mod attribute_runtime;
 mod create;
 pub mod delete;
 pub mod fork_source_lifecycle;

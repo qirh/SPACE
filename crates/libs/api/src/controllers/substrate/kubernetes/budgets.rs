@@ -9,7 +9,8 @@ use tokio::time::Instant;
 
 /// The budgets of `create_execution`'s readiness wait and preserve decision,
 /// `suspend_execution`'s durability wait, started warm-pool adoption's
-/// split-receipt and command-readiness waits and teardown's worker connect.
+/// split-receipt and command-readiness waits, warm-pool adoption's label write
+/// and teardown's worker connect.
 ///
 /// Production uses [`Default`], which is exactly the constants each field
 /// names, so production deadlines, error messages and logs are unchanged.
@@ -36,6 +37,9 @@ pub(super) struct SubstrateBudgets {
     /// adoption waits for its guest to report command readiness after the
     /// pool's Wake, within the adoption's own readiness budget.
     pub(super) pooled_command_ready: Duration,
+    /// [`super::adapter::ADOPTION_LABEL_TIMEOUT`]: the bound on each label
+    /// write warm-pool adoption makes, throttling retries included.
+    pub(super) adoption_label: Duration,
     /// [`super::POD_WORKER_CONNECT_TIMEOUT`], as teardown's connect bound for
     /// the pod's worker.
     pub(super) teardown_worker_connect: Duration,
@@ -49,6 +53,7 @@ impl SubstrateBudgets {
         suspend_durability: super::adapter::TEARDOWN_SUSPEND_DURABILITY_BUDGET,
         pooled_split_receipt_wait: super::adapter::WARM_POOL_SETUP_RPC_TIMEOUT,
         pooled_command_ready: super::adapter::POOLED_COMMAND_READY_BUDGET,
+        adoption_label: super::adapter::ADOPTION_LABEL_TIMEOUT,
         teardown_worker_connect: super::POD_WORKER_CONNECT_TIMEOUT,
     };
 
