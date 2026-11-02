@@ -107,7 +107,7 @@ async fn the_debug_handler_answers_a_contended_read_with_a_503()
         let response = get_sandbox_debug(
             State(state.clone()),
             axum::Extension(crate::middleware::auth::AuthUser(actor.clone())),
-            Path(SandboxId::new()),
+            Path(SandboxId::new().to_string()),
         )
         .await;
 
