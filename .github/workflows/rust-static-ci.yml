@@ -360,3 +360,27 @@ jobs:
         with:
           path: ${{ runner.temp }}/space-sccache
           key: ${{ steps.rust-cache-key.outputs.key }}
+
+  windows_guest:
+    if: github.repository == 'perplexityai/SPACE'
+    name: Windows guest checks
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Check out SPACE
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install protobuf compiler
+        run: |
+          choco install protoc --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Compile and lint native Windows code and tests
+        run: >-
+          cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets
+          -p pplx-space-spaced-guest-windows -p pplx-space-spaced-guest-svc
+          -- -D warnings
+      - name: Run native Windows unit tests
+        run: >-
+          cargo test --locked --target x86_64-pc-windows-msvc
+          -p pplx-space-spaced-guest-windows --lib
