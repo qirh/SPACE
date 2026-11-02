@@ -3,6 +3,7 @@ use pplx_space_common_core::types::SandboxId;
 use super::*;
 use pplx_space_common_core::sql;
 use pplx_space_net_common::NetworkPolicy;
+use pplx_space_sandbox_store as sandbox_store;
 
 fn proto_spaced_version(value: Option<&str>) -> Option<SemVer> {
     let value = value?;
@@ -346,16 +347,7 @@ pub(super) fn network_policy_status_for(
 /// (Restore, Wake) carry their own dedicated CAS upstream of this
 /// helper.
 pub(super) async fn maybe_update_sandbox_lifecycle(pool: &PgPool, id: SandboxId, lifecycle: &str) {
-    if let Err(err) = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = $1
-          WHERE id = $2
-            AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
-    ))
-    .bind(lifecycle)
-    .bind(id)
-    .execute(pool)
-    .await
+    if let Err(err) = sandbox_store::action_stamp::stamp_action_lifecycle(pool, id, lifecycle).await
     {
         tracing::warn!(
             sandbox_id = %id,
@@ -376,17 +368,8 @@ pub(super) async fn maybe_update_sandbox_state(
     lifecycle: &str,
     placement: &str,
 ) {
-    if let Err(err) = sqlx::query(sql!(
-        "UPDATE sandboxes
-            SET lifecycle = $1, placement = $2
-          WHERE id = $3
-            AND lifecycle NOT IN ('failed', 'quarantined', 'deleted', 'cleanup_required')"
-    ))
-    .bind(lifecycle)
-    .bind(placement)
-    .bind(id)
-    .execute(pool)
-    .await
+    if let Err(err) =
+        sandbox_store::action_stamp::stamp_action_state(pool, id, lifecycle, placement).await
     {
         tracing::warn!(
             sandbox_id = %id,
