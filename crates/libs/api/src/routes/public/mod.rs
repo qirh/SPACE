@@ -27,7 +27,7 @@ mod processes;
 pub(crate) mod request_context;
 pub(crate) mod sandboxes;
 pub(crate) mod sessions;
-mod snapshots;
+pub(crate) mod snapshots;
 mod templates;
 mod timeout;
 
