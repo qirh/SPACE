@@ -414,6 +414,22 @@ pub fn stranded_error(sandbox_id: SandboxId, stranded: EnvironmentMove) -> super
     }
 }
 
+/// What [`super::SubstrateAdapter::upgrade_stopped_runtime`] did to a stopped
+/// sandbox, which it leaves stopped either way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StoppedRuntimeUpgrade {
+    /// The decision keeps the sandbox on the environment it last ran under:
+    /// nothing was placed or booted.
+    AsRecorded,
+    /// The node booted the sandbox's disk under the cluster default and
+    /// stopped it again, or found it already there. A retry names the same
+    /// operation and changes nothing more.
+    Upgraded {
+        target: EnvironmentReference,
+        operation_id: uuid::Uuid,
+    },
+}
+
 /// How long a policy read is reused. Activations read the policy on every
 /// resume and start, which a short reuse keeps off the database; a policy
 /// change reaches activations within this long, and nodes enforce it on

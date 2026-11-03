@@ -14,12 +14,17 @@ use crate::controllers::substrate::{ActivationOptions, RecoveryCharge, Substrate
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-const E0: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-const E1: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+pub(super) const E0: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+pub(super) const E1: &str =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 
 /// The cluster default is E1; E0, which the sandbox's checkpoint was produced
 /// by, is blocked. `e0_upgrade_edges` are E0's certified upgrade edges.
-async fn block_e0_for_e1(pool: &sqlx::PgPool, e0_upgrade_edges: &[&str]) -> Result<(), BoxError> {
+pub(super) async fn block_e0_for_e1(
+    pool: &sqlx::PgPool,
+    e0_upgrade_edges: &[&str],
+) -> Result<(), BoxError> {
     use pplx_space_runtime_environment_policy_store::{
         PolicyChange, PolicyChangeReason, RuntimeEnvironmentState, set_default,
         set_environment_state,
@@ -55,6 +60,30 @@ async fn block_e0_for_e1(pool: &sqlx::PgPool, e0_upgrade_edges: &[&str]) -> Resu
         .execute(pool)
         .await?;
     }
+    Ok(())
+}
+
+/// What the node publishes for a stopped sandbox: the environment it last
+/// ran under.
+pub(super) async fn publish_environment(
+    pool: &sqlx::PgPool,
+    sandbox_id: SandboxId,
+    node_id: pplx_space_common_core::types::NodeId,
+    environment: &str,
+) -> Result<(), BoxError> {
+    sqlx::query(sql!(
+        "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, execution_metadata)
+         VALUES ($1, $2, 'stopped', jsonb_build_object('environment', $3::text))
+         ON CONFLICT (sandbox_id) DO UPDATE
+            SET status = EXCLUDED.status,
+                execution_metadata = EXCLUDED.execution_metadata,
+                updated_at = NOW()"
+    ))
+    .bind(sandbox_id)
+    .bind(node_id)
+    .bind(environment)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -289,15 +318,7 @@ async fn a_stopped_start_off_a_blocked_environment_wakes_by_the_upgrade(
     .bind(sandbox_id)
     .execute(&pool)
     .await?;
-    sqlx::query(sql!(
-        "INSERT INTO sandbox_observed_states (sandbox_id, node_id, status, execution_metadata)
-         VALUES ($1, $2, 'stopped', jsonb_build_object('environment', $3::text))"
-    ))
-    .bind(sandbox_id)
-    .bind(node_id)
-    .bind(E0)
-    .execute(&pool)
-    .await?;
+    publish_environment(&pool, sandbox_id, node_id, E0).await?;
     block_e0_for_e1(&pool, &[E1]).await?;
     if deprecated {
         use pplx_space_runtime_environment_policy_store::{

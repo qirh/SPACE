@@ -4295,6 +4295,61 @@ async fn activation_completion_receipt_converges_and_releases_only_its_attempt()
     Ok(())
 }
 
+/// A stopped sandbox's runtime upgrade boots its disk under an activation
+/// attempt that targets `stopped`, while the row stays `stopped`. No receipt
+/// the boot can publish, for the started boot or the stopped end, moves the
+/// row or releases the attempt; the upgrade retires the execution itself.
+#[tokio::test(flavor = "current_thread")]
+async fn activation_completion_receipt_never_moves_a_stopped_runtime_upgrade() -> TestResult {
+    let Some(db) = try_pg_test_db().await? else {
+        return Ok(());
+    };
+    let node_id = NodeId::new();
+    let sandbox_id = SandboxId::new();
+    let attempt = Uuid::now_v7();
+    insert_ready_worker_node(&db.pool, node_id).await?;
+    insert_active_sandbox(&db.pool, sandbox_id, node_id, "stopped").await?;
+    insert_k8s_execution(&db.pool, sandbox_id, 7, "running", Some("100.64.0.7")).await?;
+    sqlx::query(
+        "UPDATE sandbox_k8s_executions
+            SET activation_attempt_id = $2,
+                route_activation_id = $2,
+                activation_attempt_expires_at = NOW() + INTERVAL '5 minutes',
+                activation_attempt_target_state = 'stopped'
+          WHERE sandbox_id = $1 AND generation = 7",
+    )
+    .bind(sandbox_id)
+    .bind(attempt)
+    .execute(&db.pool)
+    .await?;
+    let mut conn = db.pool.acquire().await?;
+
+    for target in ["started", "stopped"] {
+        let receipt = activation_completed_state(sandbox_id, Uuid::now_v7(), target, 7, attempt);
+        publish_sandbox_states(&mut conn, node_id, &[receipt]).await?;
+
+        assert_eq!(
+            sandbox_lifecycle(&db.pool, sandbox_id).await?,
+            "stopped",
+            "{target}"
+        );
+        let owner = sqlx::query_as::<_, (Option<Uuid>, Option<String>)>(
+            "SELECT activation_attempt_id, activation_attempt_target_state
+               FROM sandbox_k8s_executions
+              WHERE sandbox_id = $1 AND generation = 7",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&db.pool)
+        .await?;
+        assert_eq!(
+            owner,
+            (Some(attempt), Some("stopped".to_string())),
+            "{target}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn activation_completion_receipt_cannot_overwrite_a_newer_suspend_claim() -> TestResult {
     let Some(db) = try_pg_test_db().await? else {

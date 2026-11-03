@@ -38,6 +38,7 @@ use sqlx::{Postgres, Transaction};
 
 mod node_eligibility;
 mod pooled;
+mod stopped_runtime_upgrade;
 mod substrate_adapter;
 mod suspend;
 mod teardown;

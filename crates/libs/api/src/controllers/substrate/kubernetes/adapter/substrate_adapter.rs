@@ -1215,6 +1215,16 @@ impl SubstrateAdapter for KubernetesSubstrate {
         })
     }
 
+    async fn upgrade_stopped_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: Duration,
+    ) -> Result<crate::controllers::substrate::runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError>
+    {
+        self.upgrade_stopped_runtime_on_kubernetes(sandbox_id, timeout)
+            .await
+    }
+
     async fn restore_execution(
         &self,
         metric_identity: pplx_space_metrics::sandbox::api::SandboxApiMetricIdentity,

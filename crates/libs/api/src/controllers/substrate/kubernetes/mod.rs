@@ -1,3 +1,12 @@
+//! The Kubernetes substrate: one pod per sandbox execution, placed through
+//! the Kubernetes API (see the substrate contract in `../AGENTS.md`).
+//!
+//! # Gaps
+//!
+//! | Refused or missing | Effect today | Owner | Removed by |
+//! |---|---|---|---|
+//! | Runtime upgrade of a stopped sandbox without starting it (`upgrade_stopped_runtime`) | [`super::SubstrateError::Unsupported`] after the decision, claim and record: no pod is placed, nothing reaches the node, and the sandbox stays stopped on its environment with the upgrade recorded on its execution | the-gigi-pplx | A node-side `runtime-upgrade` pod mode whose container create runs the upgrade with the pod's network namespace, which the operation places and waits on |
+
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},

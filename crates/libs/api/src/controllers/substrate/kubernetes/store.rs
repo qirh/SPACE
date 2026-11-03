@@ -53,6 +53,8 @@ mod runtime_upgrade;
 mod started_recovery;
 mod suspend;
 
+pub(super) use activation_fence::RecordedRuntimeUpgrade;
+
 #[derive(Clone)]
 pub(super) struct K8sStore {
     pool: PgPool,

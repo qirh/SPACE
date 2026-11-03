@@ -1364,6 +1364,52 @@ the restore and activation leases already give, and a Wake that meets the
 node's fence is retried to its deadline and answers a retryable 503. The
 decision is counted by `runtime_upgrade.activation.decision`.
 
+### Upgrading a stopped sandbox without starting it
+
+`SubstrateAdapter::upgrade_stopped_runtime` is meant to move a stopped
+sandbox to the cluster default and leave it stopped, for a caller such as an
+upgrade campaign that shouldn't start anything. It takes the start-time
+decision above, whatever `SPACE_RUNTIME_UPGRADE_AT_ACTIVATION_ENABLED` says,
+so it reads the same evidence, refuses a stranded sandbox with the same 412
+and names the operation a start would. Nothing calls it yet. Direct returns
+`Unsupported` (its gap table has the row).
+
+On Kubernetes the operation decides, claims and records, and the boot isn't
+there yet
+(`crates/libs/api/src/controllers/substrate/kubernetes/adapter/stopped_runtime_upgrade.rs`):
+
+1. **Claim.** An activation attempt targeting `stopped` on the sandbox's
+   execution, which nothing else claims on a `stopped` row.
+   Activation-completion receipts project only a `created`, `started` or
+   `paused` target, so the claim never moves the row, and a user start meets
+   it like any activation's claim. A stopped sandbox whose disk is only in
+   object storage is refused with `FailedPrecondition` first.
+2. **Record** the upgrade (operation, target and authorization) on the
+   claimed execution in `sandbox_k8s_executions`, so a retry repeats exactly
+   that upgrade: sandbox-manager refuses an operation that names another
+   target or authorization than the one it recorded.
+3. **Refuse** with `Unsupported` (501), ending the claim's lease. Booting the
+   disk under the target needs a node-side `runtime-upgrade` pod mode, whose
+   container create runs `UpgradeRuntime` with the pod's network namespace.
+   Until it lands, no pod is placed, nothing reaches the node, and the
+   sandbox stays stopped on its environment. The Kubernetes gap table in
+   `kubernetes/mod.rs` has the row.
+
+A retry that finds the execution an earlier attempt left takes it over with
+an activation attempt of its own before it reads what was recorded, so
+nothing can be recorded between the two; a start that moved the sandbox on
+or another attempt that replaced the claim keeps the execution. An execution
+claimed with nothing recorded is retired, pod included, and the retry
+decides afresh. One with a recorded upgrade keeps it, whatever the policy
+says now, so the boot finishes the operation a node may have begun. Once the
+pod mode lands, the operation places that pod, waits for the node's answer
+and its publication of the sandbox stopped under the default, enqueues the
+upgraded disk's current-instance backup and then retires the execution. The
+`orphaned_sandboxes`, transient-lifecycle, `stuck_container_creating_gc` and
+`orphaned_restore_pod_gc` loops all leave the claimed execution alone: the
+first two never select a `stopped` row, the stuck-pod GC skips restore pods,
+and the restore-pod GC keeps a pod at the active generation.
+
 ### Node runtime provisioning
 
 The whole-node `runtime-provisioning` facet reads

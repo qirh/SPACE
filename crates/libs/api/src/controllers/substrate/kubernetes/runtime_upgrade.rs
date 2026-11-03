@@ -12,7 +12,7 @@
 use super::KubernetesSubstrate;
 use crate::controllers::substrate::SubstrateError;
 use crate::controllers::substrate::runtime_upgrade::{
-    RuntimePlan, UpgradeActivation, attribute, decide, stranded_error,
+    EnvironmentMove, RuntimePlan, UpgradeActivation, attribute, decide, stranded_error,
 };
 use pplx_space_common_core::types::SandboxId;
 use pplx_space_runtime_environment_policy_store::RuntimeEnvironmentState;
@@ -31,6 +31,21 @@ impl KubernetesSubstrate {
         if !self.k8s.runtime_upgrade_at_activation.is_enabled() {
             return Ok(None);
         }
+        Ok(self
+            .decide_runtime_upgrade(sandbox_id, activation, restore_storage_uri)
+            .await?
+            .map(|decided| decided.wake))
+    }
+
+    /// [`Self::activation_runtime_upgrade`]'s decision, whatever the
+    /// activation setting: the move and the upgrade that makes it, or `None`
+    /// to stay on the recorded environment. A stranded sandbox is refused.
+    pub(super) async fn decide_runtime_upgrade(
+        &self,
+        sandbox_id: SandboxId,
+        activation: UpgradeActivation,
+        restore_storage_uri: Option<&str>,
+    ) -> Result<Option<DecidedUpgrade>, SubstrateError> {
         let policy = self
             .runtime_policy
             .get(|| self.store.runtime_environment_policy())
@@ -94,7 +109,7 @@ impl KubernetesSubstrate {
         match plan {
             RuntimePlan::AsRecorded | RuntimePlan::RestoreOnDefault(_) => Ok(None),
             RuntimePlan::ColdBootUpgrade(to_default) => {
-                let upgrade = to_default.wake_upgrade(
+                let wake = to_default.wake_upgrade(
                     sandbox_id,
                     activation,
                     &recorded.subject,
@@ -102,23 +117,37 @@ impl KubernetesSubstrate {
                 );
                 tracing::info!(
                     sandbox_id = %sandbox_id,
-                    operation_id = %upgrade.operation_id,
+                    operation_id = %wake.operation_id,
                     "waking the sandbox by its runtime upgrade"
                 );
-                Ok(Some(upgrade))
+                Ok(Some(DecidedUpgrade {
+                    movement: to_default,
+                    operation_id: to_default.operation_id(
+                        sandbox_id,
+                        activation,
+                        &recorded.subject,
+                    ),
+                    wake,
+                }))
             }
             RuntimePlan::Stranded(to_default) => Err(stranded_error(sandbox_id, to_default)),
         }
     }
 }
 
+/// A cold-boot upgrade [`KubernetesSubstrate::decide_runtime_upgrade`] chose.
+pub(super) struct DecidedUpgrade {
+    pub(super) movement: EnvironmentMove,
+    /// The operation the upgrade runs as; `wake` carries it too.
+    pub(super) operation_id: uuid::Uuid,
+    /// The `WakeRequest.runtime_upgrade` that asks the node for it.
+    pub(super) wake: pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade,
+}
+
 /// No recorded execution attributes the sandbox to a catalog environment. The
 /// node's execution policy still refuses a runtime that may not execute; this
 /// only means the control plane can't move it first.
-fn unattributed(
-    sandbox_id: SandboxId,
-    activation: UpgradeActivation,
-) -> Option<pplx_space_sbx_mgr_client::proto::WakeRuntimeUpgrade> {
+fn unattributed<T>(sandbox_id: SandboxId, activation: UpgradeActivation) -> Option<T> {
     tracing::info!(
         sandbox_id = %sandbox_id,
         activation = activation.as_str(),

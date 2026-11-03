@@ -24,6 +24,7 @@ pub(crate) use kubernetes_tests::{
 
 mod native_pod_failover;
 mod runtime_upgrade_dispatch;
+mod stopped_runtime_upgrade;
 mod substrate_scope;
 
 mod kubernetes_tests {

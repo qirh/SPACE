@@ -1377,6 +1377,21 @@ pub trait SubstrateAdapter: Send + Sync {
         charge: RecoveryCharge,
     ) -> Result<ExecutionActivation, SubstrateError>;
 
+    /// Upgrade a stopped sandbox's runtime to the cluster default without
+    /// starting it: decide the move as a start would, boot the disk under the
+    /// default on a short-lived execution and stop it again. The sandbox's
+    /// row stays `stopped` throughout, and a failure leaves it on its old
+    /// environment; a retry names the same operation. Nothing in this
+    /// decision reads the at-activation setting: the caller decides when to
+    /// run it. `timeout` bounds the boot. Both substrates answer
+    /// `Unsupported` today, Kubernetes after recording the decision (see the
+    /// gap rows in `direct.rs` and `kubernetes/mod.rs`).
+    async fn upgrade_stopped_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: Duration,
+    ) -> Result<runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError>;
+
     /// Restore a suspended sandbox through the active execution object.
     ///
     /// This is separate from `start_execution` because restore may use
@@ -2573,6 +2588,22 @@ impl SubstrateAdapter for Substrate {
                 substrate
                     .start_execution(metric_identity, sandbox_id, options, charge)
                     .await
+            }
+        }
+    }
+
+    async fn upgrade_stopped_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: Duration,
+    ) -> Result<runtime_upgrade::StoppedRuntimeUpgrade, SubstrateError> {
+        match &self.inner {
+            Inner::Direct(substrate) => {
+                substrate.upgrade_stopped_runtime(sandbox_id, timeout).await
+            }
+            #[cfg(feature = "kubernetes")]
+            Inner::Kubernetes(substrate) => {
+                substrate.upgrade_stopped_runtime(sandbox_id, timeout).await
             }
         }
     }
