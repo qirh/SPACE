@@ -266,8 +266,8 @@ member directories:
 ```toml
 [rules.dependency_fence.sbxmgr_rusqlite]
 packages = ["libsqlite3-sys", "pplx-space-sqlite", "rusqlite"]
-members = ["crates/libs/sbx/mgr/**", "crates/apps/sbx/**"]
-allow = ["crates/libs/sbx/mgr/store"]
+members = ["crates/{l20_domain,l30_storage,l40_api}/sbx/mgr/**", "crates/l50_app/sbx/**"]
+allow = ["crates/l30_storage/sbx/mgr/store"]
 
 [rules.dependency_fence.sbxmgr_rusqlite.no_crossing]
 mode = "required"
