@@ -444,6 +444,7 @@ pub async fn run(
             native_files::NativeFileAccessClient::from_env()
                 .await
                 .map_err(RunDataPlaneError::NativeFiles)?,
+            config.upload_admission.as_ref(),
         ))),
     };
     let cluster_api = connect_cluster_api_clients_for_startup(&shutdown_token)

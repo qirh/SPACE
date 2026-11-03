@@ -4,6 +4,7 @@
 
 mod fakes;
 mod mutations;
+mod write;
 
 use std::sync::{
     Arc,
@@ -53,15 +54,21 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// With the data plane's upload admission set to `upload_admission`.
+    async fn start_with(upload_admission: Option<crate::UploadAdmissionConfig>) -> Self {
         let (worker, worker_addr) = FakeWorker::start().await;
         let (api, api_addr) = FakeApi::start(worker_addr).await;
         let mut state = crate::tests::test_data_plane_state().await;
         let channel = tonic::transport::Endpoint::from_shared(format!("http://{api_addr}"))
             .unwrap()
             .connect_lazy();
-        state.native_files = Some(Arc::new(NativeFiles::new(NativeFileAccessClient::new(
-            channel,
-        ))));
+        state.native_files = Some(Arc::new(NativeFiles::new(
+            NativeFileAccessClient::new(channel),
+            upload_admission.as_ref(),
+        )));
         Self { state, api, worker }
     }
 
