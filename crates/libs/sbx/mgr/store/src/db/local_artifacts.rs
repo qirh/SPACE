@@ -716,6 +716,50 @@ pub fn drop_stopped_artifact_pin(conn: &Connection, id: &str) -> Result<bool> {
     Ok(changed == 1)
 }
 
+/// A sandbox row's artifact pin, read with its catalog row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SandboxArtifactPin {
+    pub local_artifact_id: Option<LocalArtifactId>,
+    /// When this node published or adopted the pinned artifact: its catalog
+    /// row's write-once `created_at`. `None` without a pin, when the pin names
+    /// no catalog row of the sandbox's own, or when the stored time can't be
+    /// decoded.
+    pub cataloged_at: Option<timestamps::EpochSeconds>,
+}
+
+db_private_outside_tests! {
+    /// See [`crate::db::read::local_artifact_pin`].
+    fn sandbox_artifact_pin(conn: &Connection, id: &str) -> Result<Option<SandboxArtifactPin>> {
+        conn.query_row(
+            "SELECT s.current_local_artifact_id, la.created_at
+             FROM sandboxes s
+             LEFT JOIN local_artifacts la
+               ON la.local_artifact_id = s.current_local_artifact_id
+              AND la.sandbox_id = s.id
+             WHERE s.id = ?1",
+            params![id],
+            |row| {
+                let local_artifact_id = row
+                    .get::<_, Option<String>>(0)?
+                    .map(|value| value.parse::<LocalArtifactId>())
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                    })?;
+                let cataloged_at = match row.get::<_, rusqlite::types::Value>(1)? {
+                    rusqlite::types::Value::Null => None,
+                    value => timestamps::EpochSeconds::decode(&value).ok(),
+                };
+                Ok(SandboxArtifactPin {
+                    local_artifact_id,
+                    cataloged_at,
+                })
+            },
+        )
+        .optional()
+    }
+}
+
 /// Capture times of the artifacts the given sandboxes pin, keyed by sandbox id.
 ///
 /// One join on the pin, so a time is the pinned artifact's by construction. A

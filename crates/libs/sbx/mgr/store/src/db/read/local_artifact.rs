@@ -3,7 +3,7 @@
 
 use pplx_space_common_core::types::{LocalArtifactId, SnapshotName};
 
-use crate::db::{Connection, LocalArtifactRow, Result};
+use crate::db::{Connection, LocalArtifactRow, Result, SandboxArtifactPin};
 
 /// How [`local_artifact`] finds its row.
 #[derive(Clone, Copy, Debug)]
@@ -51,4 +51,14 @@ pub fn local_artifact_unowned(
     local_artifact_id: LocalArtifactId,
 ) -> Result<bool> {
     crate::db::local_artifact_leases::gc_staging_is_unowned(conn, &local_artifact_id.to_string())
+}
+
+/// The artifact `sandbox_id` pins and when this node cataloged it, read in one
+/// statement so the time is the pinned artifact's; `None` without such a
+/// sandbox.
+pub fn local_artifact_pin(
+    conn: &Connection,
+    sandbox_id: &str,
+) -> Result<Option<SandboxArtifactPin>> {
+    crate::db::sandbox_artifact_pin(conn, sandbox_id)
 }

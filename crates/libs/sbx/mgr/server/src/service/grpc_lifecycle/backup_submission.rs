@@ -119,6 +119,7 @@ impl SandboxManagerService {
         restore_visible: bool,
     ) -> Result<SubmitSuspendSnapshotOutcome, String> {
         let (local_artifact_id, backup_attempt_id) = artifact_attempt;
+        let _artifact_guard = self.auto_lifecycle.artifact_lock(&sandbox.id).lock().await;
         self.submit_artifact_backup(
             sandbox,
             ArtifactBackupSubmission {
@@ -255,6 +256,74 @@ impl SandboxManagerService {
         }
     }
 
+    /// Admit a backup of `local_artifact_id` from the sandbox's canonical
+    /// suspend directory, whose metadata reads as `sidecar`, before anything
+    /// is prepared. The caller holds the sandbox's artifact lock, which every
+    /// suspend publication holds from its rename to its row commit or
+    /// rollback, so the row and the sidecar read here describe one state.
+    ///
+    /// The row must pin the artifact, and a sidecar naming another one must
+    /// have been in the directory when this node cataloged the pinned id. A
+    /// rolled-back suspend leaves the row pinning its predecessor over the
+    /// newer capture it published; that capture was taken after the
+    /// predecessor was cataloged. An import, adopted under a fresh id, keeps
+    /// the exporter's sidecar, captured before the adoption. A sidecar
+    /// without an id, or none, proves nothing either way.
+    fn admit_canonical_suspend_artifact(
+        &self,
+        sandbox_id: &str,
+        local_artifact_id: LocalArtifactId,
+        snapshot_dir: &str,
+        sidecar: Option<&crate::snapshot_upload::SnapshotMeta>,
+    ) -> Result<(), ArtifactBackupSubmissionError> {
+        debug_assert!(
+            self.auto_lifecycle
+                .artifact_lock(sandbox_id)
+                .try_lock()
+                .is_err(),
+            "backup admission for {sandbox_id} requires the sandbox's artifact lock",
+        );
+        let pin = {
+            let db = self
+                .db_conn()
+                .map_err(|status| status.message().to_owned())?;
+            crate::db::read::local_artifact_pin(&db, sandbox_id)
+                .map_err(|error| format!("read sandbox {sandbox_id}: {error}"))?
+        };
+        let pinned = pin.and_then(|pin| pin.local_artifact_id);
+        if pinned != Some(local_artifact_id) {
+            return Err(ArtifactBackupSubmissionError::Replaced(format!(
+                "local artifact {local_artifact_id} was replaced in {snapshot_dir}: \
+                 sandbox {sandbox_id} pins {}",
+                pinned.map_or_else(|| "no artifact".to_owned(), |id| id.to_string()),
+            )));
+        }
+        let Some(sidecar) = sidecar else {
+            return Ok(());
+        };
+        let Some(named) = sidecar.local_artifact_id else {
+            return Ok(());
+        };
+        if named == local_artifact_id {
+            return Ok(());
+        }
+        let cataloged_at = pin
+            .and_then(|pin| pin.cataloged_at)
+            .and_then(|seconds| jiff::Timestamp::from_second(seconds.get()).ok());
+        let captured_at = sidecar.created_at.parse::<jiff::Timestamp>().ok();
+        if let (Some(cataloged_at), Some(captured_at)) = (cataloged_at, captured_at)
+            && captured_at < cataloged_at
+        {
+            return Ok(());
+        }
+        Err(ArtifactBackupSubmissionError::Replaced(format!(
+            "local artifact {local_artifact_id} was replaced in {snapshot_dir}: its metadata \
+             names artifact {named}, captured at {}, and {local_artifact_id} was cataloged at {}",
+            sidecar.created_at,
+            cataloged_at.map_or_else(|| "an unknown time".to_owned(), |at| at.to_string()),
+        )))
+    }
+
     pub(super) async fn submit_artifact_backup(
         &self,
         sandbox: &crate::db::SandboxRow,
@@ -272,6 +341,28 @@ impl SandboxManagerService {
             handoff,
             execution_generation,
         } = submission;
+        // Encrypted-rootfs sandboxes are supported here: the publication staged
+        // the encrypted `snapshot.luks` (vmstate+memory) and `cow.luks` (rootfs
+        // delta), and `metadata.json` carries `encrypted: true` so the artifact
+        // set below resolves to the encrypted shape. Nothing to refuse.
+        let meta_path = std::path::Path::new(snapshot_dir)
+            .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+        // Read once: admission checks this copy, and preparation uploads it.
+        let published = match std::fs::read(&meta_path) {
+            Ok(bytes) => serde_json::from_slice::<crate::snapshot_upload::SnapshotMeta>(&bytes)
+                .map(Some)
+                .map_err(|err| {
+                    format!(
+                        "published snapshot metadata is unparseable at {}: {err}",
+                        meta_path.display()
+                    )
+                }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!(
+                "read published snapshot metadata at {} failed: {err}",
+                meta_path.display()
+            )),
+        };
         // A suspend publishes over the sandbox's one suspend directory, so a
         // suspend artifact there is the one the row pins, or a newer suspend
         // replaced it and its files are that suspend's. A teardown fence
@@ -281,22 +372,12 @@ impl SandboxManagerService {
             && artifact_origin == ArtifactOrigin::Suspend
             && crate::service::is_canonical_suspend_snapshot_dir(std::path::Path::new(snapshot_dir))
         {
-            let pinned = {
-                let db = self
-                    .db_conn()
-                    .map_err(|status| status.message().to_owned())?;
-                crate::db::read::sandbox(&db, &sandbox.id)
-                    .map_err(|error| format!("read sandbox {}: {error}", sandbox.id))?
-                    .and_then(|row| row.current_local_artifact_id)
-            };
-            if pinned != Some(local_artifact_id) {
-                return Err(ArtifactBackupSubmissionError::Replaced(format!(
-                    "local artifact {local_artifact_id} was replaced in {snapshot_dir}: \
-                     sandbox {} pins {}",
-                    sandbox.id,
-                    pinned.map_or_else(|| "no artifact".to_owned(), |id| id.to_string()),
-                )));
-            }
+            self.admit_canonical_suspend_artifact(
+                &sandbox.id,
+                local_artifact_id,
+                snapshot_dir,
+                published.as_ref().ok().and_then(Option::as_ref),
+            )?;
         }
         let config: &crate::snapshot_upload::SnapshotUploadConfig = match request_override {
             Some(c) => c,
@@ -306,33 +387,15 @@ impl SandboxManagerService {
             },
         };
 
-        // Encrypted-rootfs sandboxes are supported here: the publication staged
-        // the encrypted `snapshot.luks` (vmstate+memory) and `cow.luks` (rootfs
-        // delta), and `metadata.json` carries `encrypted: true` so the artifact
-        // set below resolves to the encrypted shape. Nothing to refuse.
-        let meta_path = std::path::Path::new(snapshot_dir)
-            .join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
-        let mut meta = match std::fs::read(&meta_path) {
-            Ok(bytes) => serde_json::from_slice::<crate::snapshot_upload::SnapshotMeta>(&bytes)
-                .map_err(|err| {
-                    format!(
-                        "published snapshot metadata is unparseable at {}: {err}",
-                        meta_path.display()
-                    )
-                })?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        let mut meta = match published? {
+            Some(meta) => meta,
+            None => {
                 suspend_snapshot_metadata(sandbox, format).map_err(|error| error.to_string())?
-            }
-            Err(err) => {
-                return Err(format!(
-                    "read published snapshot metadata at {} failed: {err}",
-                    meta_path.display()
-                )
-                .into());
             }
         };
         // An imported artifact's sidecar names the exporter's id, not the one
-        // this backup adopts.
+        // this backup adopts. In the canonical suspend directory this is the
+        // id admission checked.
         let sidecar_artifact_id = meta.local_artifact_id;
         meta.local_artifact_id = Some(local_artifact_id);
         meta.artifact_kind = Some(artifact_kind);

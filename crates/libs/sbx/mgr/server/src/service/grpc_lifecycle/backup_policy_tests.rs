@@ -398,6 +398,10 @@ fn upload_config(bucket: &str) -> crate::snapshot_upload::SnapshotUploadConfig {
     .unwrap()
 }
 
+/// When [`write_artifact`]'s sidecar says its artifact was captured: before
+/// any catalog row a test writes.
+const ARTIFACT_CAPTURED_AT: &str = "2026-10-10T00:00:00Z";
+
 /// Write a published artifact directory whose metadata names
 /// `local_artifact_id`, as an imported artifact's names the exporter's, or no
 /// artifact identity, so any identity in the durable intent came from the
@@ -407,6 +411,22 @@ fn write_artifact(
     sandbox_id: &str,
     files: &[&str],
     local_artifact_id: Option<LocalArtifactId>,
+) {
+    write_artifact_captured_at(
+        dir,
+        sandbox_id,
+        files,
+        local_artifact_id,
+        ARTIFACT_CAPTURED_AT,
+    );
+}
+
+fn write_artifact_captured_at(
+    dir: &std::path::Path,
+    sandbox_id: &str,
+    files: &[&str],
+    local_artifact_id: Option<LocalArtifactId>,
+    captured_at: &str,
 ) {
     let execution = pplx_space_common_core::types::SnapshotExecutionMetadata::new(
         pplx_space_common_core::types::ExecutionMetadata::initial_firecracker(
@@ -426,7 +446,7 @@ fn write_artifact(
             "execution": execution.execution(),
             "sandbox_id": sandbox_id,
             "size_bytes": 0,
-            "created_at": "2026-10-10T00:00:00Z",
+            "created_at": captured_at,
             "source": {"runtime": "fc", "template_id": "seed"},
             "local_artifact_id": local_artifact_id,
         }))
@@ -665,62 +685,136 @@ async fn durable_artifact_backup_persists_the_submitted_artifact_identity() {
     }
 }
 
-/// A suspend publishes over the sandbox's one suspend directory. A backup of
-/// a suspend artifact there that the row no longer pins would upload a newer
-/// suspend's files under its id, so admission refuses it before preparing
-/// anything.
+/// A suspend publishes over the sandbox's one suspend directory. A backup of a
+/// suspend artifact there whose files may be a newer suspend's is refused
+/// before anything is prepared: one the row no longer pins, and one the row
+/// still pins whose sidecar names a capture taken after this node cataloged
+/// it, as a rolled-back suspend leaves. An import, adopted under a fresh id,
+/// keeps the exporter's sidecar, captured before the adoption, and is
+/// admitted.
 #[tokio::test]
-async fn backup_of_a_replaced_suspend_artifact_is_refused_at_admission() {
-    for newer_pinned in [true, false] {
+async fn backup_admission_checks_the_pin_and_the_sidecar_together() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Pin {
+        Requested,
+        Another,
+        Nothing,
+    }
+    struct Case {
+        name: &'static str,
+        pin: Pin,
+        /// Whether the sidecar's capture postdates the pinned artifact's
+        /// catalog row rather than preceding it.
+        captured_after_cataloging: bool,
+        admitted: bool,
+    }
+    let cases = [
+        Case {
+            name: "the row pins a newer artifact",
+            pin: Pin::Another,
+            captured_after_cataloging: false,
+            admitted: false,
+        },
+        Case {
+            name: "the row pins no artifact",
+            pin: Pin::Nothing,
+            captured_after_cataloging: false,
+            admitted: false,
+        },
+        Case {
+            name: "a newer capture replaced the pinned artifact",
+            pin: Pin::Requested,
+            captured_after_cataloging: true,
+            admitted: false,
+        },
+        Case {
+            name: "an import keeps the exporter's sidecar",
+            pin: Pin::Requested,
+            captured_after_cataloging: false,
+            admitted: true,
+        },
+    ];
+    for case in cases {
         let conn = crate::db::test_conn();
         let id = SandboxId::new().to_string();
         insert_test_sandbox(&conn, &id, SandboxState::Suspended);
         let root = tempfile::tempdir().unwrap();
         let snapshot_dir = root.path().join("snapshot");
-        let newer = LocalArtifactId::new();
-        write_artifact(
-            &snapshot_dir,
-            &id,
-            &["vmstate", "memory", "rootfs.ext4"],
-            Some(newer),
-        );
-        if newer_pinned {
+        let requested = LocalArtifactId::new();
+        let named = LocalArtifactId::new();
+        let pinned = match case.pin {
+            Pin::Requested => Some(requested),
+            Pin::Another => Some(named),
+            Pin::Nothing => None,
+        };
+        let write_sidecar = |captured_at: &str| {
+            write_artifact_captured_at(
+                &snapshot_dir,
+                &id,
+                &["vmstate", "memory", "rootfs.ext4"],
+                Some(named),
+                captured_at,
+            );
+        };
+        if !case.captured_after_cataloging {
+            write_sidecar(ARTIFACT_CAPTURED_AT);
+        }
+        if let Some(pinned) = pinned {
             assert!(
                 crate::db::adopt_suspended_local_artifact(
                     &conn,
                     &id,
-                    newer,
+                    pinned,
                     snapshot_dir.to_str().unwrap(),
                 )
-                .unwrap()
+                .unwrap(),
+                "{}",
+                case.name
             );
         }
+        if case.captured_after_cataloging {
+            write_sidecar(&jiff::Timestamp::now().to_string());
+        }
+        let sidecar_path = snapshot_dir.join(crate::snapshot_upload::SNAPSHOT_METADATA_FILENAME);
+        let sidecar = std::fs::read(&sidecar_path).unwrap();
         let service = SandboxManagerService::for_test(conn);
         let sandbox = service.lookup_sandbox(&id).unwrap();
-        let replaced = LocalArtifactId::new();
         let config = upload_config("request-bucket");
 
-        let outcome = service
-            .submit_artifact_backup(
-                &sandbox,
-                ArtifactBackupSubmission {
-                    local_artifact_id: replaced,
-                    artifact_kind: ArtifactKind::Full,
-                    artifact_origin: ArtifactOrigin::Suspend,
-                    snapshot_name: None,
-                    backup_attempt_id: BackupAttemptId::new(),
-                    snapshot_dir: snapshot_dir.to_str().unwrap(),
-                    request_override: Some(&config),
-                    format: SuspendSnapshotFormat::Full,
-                    handoff: ArtifactBackupHandoff::RestoreVisible,
-                    execution_generation: None,
-                },
-            )
-            .await;
+        let outcome = {
+            let _artifact_guard = service.auto_lifecycle.artifact_lock(&id).lock().await;
+            // A full-codec artifact's metadata is rewritten in place once
+            // admitted, so a refusal that came after preparation would show.
+            service
+                .submit_artifact_backup(
+                    &sandbox,
+                    ArtifactBackupSubmission {
+                        local_artifact_id: requested,
+                        artifact_kind: ArtifactKind::Full,
+                        artifact_origin: ArtifactOrigin::Suspend,
+                        snapshot_name: None,
+                        backup_attempt_id: BackupAttemptId::new(),
+                        snapshot_dir: snapshot_dir.to_str().unwrap(),
+                        request_override: Some(&config),
+                        format: SuspendSnapshotFormat::Full,
+                        handoff: ArtifactBackupHandoff::DurableWorker,
+                        execution_generation: None,
+                    },
+                )
+                .await
+        };
 
-        let case = format!("newer_pinned={newer_pinned}: {outcome:?}");
+        let case_name = format!("{}: {outcome:?}", case.name);
+        if case.admitted {
+            assert!(
+                matches!(outcome, Ok(SubmitSuspendSnapshotOutcome::Enqueued { .. })),
+                "{case_name}"
+            );
+            assert_eq!(snapshot_upload_jobs(&service, &id), 1, "{case_name}");
+            continue;
+        }
         let Err(error) = outcome else {
-            panic!("{case}")
+            panic!("{case_name}")
         };
         assert_eq!(
             super::artifact_backup::artifact_backup_submission_status(
@@ -729,66 +823,20 @@ async fn backup_of_a_replaced_suspend_artifact_is_refused_at_admission() {
             )
             .code(),
             tonic::Code::FailedPrecondition,
-            "{case}"
+            "{case_name}"
         );
-        assert_eq!(snapshot_upload_jobs(&service, &id), 0, "{case}");
+        assert_eq!(snapshot_upload_jobs(&service, &id), 0, "{case_name}");
+        assert_eq!(
+            std::fs::read(&sidecar_path).unwrap(),
+            sidecar,
+            "{case_name}: the sidecar must still name {named}"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "{case_name}: nothing is staged beside the directory"
+        );
     }
-}
-
-/// An imported artifact's sidecar names the exporter's id while the row pins
-/// the id its adoption gave it, so its backup is admitted.
-#[tokio::test]
-async fn backup_of_a_pinned_imported_artifact_is_admitted() {
-    let conn = crate::db::test_conn();
-    let id = SandboxId::new().to_string();
-    insert_test_sandbox(&conn, &id, SandboxState::Suspended);
-    let root = tempfile::tempdir().unwrap();
-    let snapshot_dir = root.path().join("snapshot");
-    write_artifact(
-        &snapshot_dir,
-        &id,
-        &["vmstate", "memory", "rootfs.ext4"],
-        Some(LocalArtifactId::new()),
-    );
-    let adopted = LocalArtifactId::new();
-    assert!(
-        crate::db::adopt_suspended_local_artifact(
-            &conn,
-            &id,
-            adopted,
-            snapshot_dir.to_str().unwrap(),
-        )
-        .unwrap()
-    );
-    let service = SandboxManagerService::for_test(conn);
-    let sandbox = service.lookup_sandbox(&id).unwrap();
-    let config = upload_config("request-bucket");
-
-    // `EnqueueArtifactBackup` hands off restore-visibly, which goes on to
-    // begin the backup remotely. Admission is the same for the durable worker.
-    let outcome = service
-        .submit_artifact_backup(
-            &sandbox,
-            ArtifactBackupSubmission {
-                local_artifact_id: adopted,
-                artifact_kind: ArtifactKind::Full,
-                artifact_origin: ArtifactOrigin::Suspend,
-                snapshot_name: None,
-                backup_attempt_id: BackupAttemptId::new(),
-                snapshot_dir: snapshot_dir.to_str().unwrap(),
-                request_override: Some(&config),
-                format: SuspendSnapshotFormat::Full,
-                handoff: ArtifactBackupHandoff::DurableWorker,
-                execution_generation: None,
-            },
-        )
-        .await;
-
-    assert!(
-        matches!(outcome, Ok(SubmitSuspendSnapshotOutcome::Enqueued { .. })),
-        "{outcome:?}"
-    );
-    assert_eq!(snapshot_upload_jobs(&service, &id), 1);
 }
 
 #[derive(Clone, Copy, Debug)]
