@@ -3,6 +3,11 @@
 {{- if lt (int .Values.shutdownGraceSeconds) 8 -}}
 {{- fail "shutdownGraceSeconds must be at least 8, the stream-open budget (MIN_SHUTDOWN_GRACE)" -}}
 {{- end -}}
+{{- /* A files request can wait 135 s for its sandbox to wake, then transfer
+(nativeFiles in values.yaml). */ -}}
+{{- if and .Values.nativeFiles.enabled (lt (int .Values.shutdownGraceSeconds) (add 135 (int .Values.nativeFiles.transferSeconds))) -}}
+{{- fail "with nativeFiles.enabled, shutdownGraceSeconds must cover the 135 s wake wait plus nativeFiles.transferSeconds" -}}
+{{- end -}}
 {{- if le (int .Values.terminationGracePeriodSeconds) (add (int .Values.preStopSleepSeconds) (int .Values.shutdownGraceSeconds) 5) -}}
 {{- fail "terminationGracePeriodSeconds must exceed preStopSleepSeconds + shutdownGraceSeconds + 5" -}}
 {{- end -}}
