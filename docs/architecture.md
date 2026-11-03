@@ -109,7 +109,7 @@ Requesting a delete cancels the sandbox's create if that create is still queued 
 
 A Native create can answer `202` before its execution records the sandbox. A `DELETE /v1/sandboxes/{sandbox_id}` in that window is accepted while the create is queued or running, for a caller who could see that create's operation: it answers with a delete operation, as for a sandbox already `creating`, and cancels or waits for the create as described above. A create that succeeds records the sandbox before it is marked succeeded, so a delete that races it still finds the sandbox. A create that fails, expires, or is canceled by an earlier delete can end without recording the sandbox, and a delete with a new `Idempotency-Key` then answers `404`. Every other Native request naming the sandbox, such as `GET /v1/sandboxes/{sandbox_id}`, answers `404` until the sandbox is recorded; poll the create operation instead.
 
-In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API and cluster controller, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
+In Kind, sandbox pods run in their own namespace, `sandboxes`, apart from the control plane in `space`. NetworkPolicies there admit only the API, the cluster controller and the data plane, on the port they dial, and limit sandbox egress to the public IPv4 internet and cluster DNS; the [Kind harness README](../infra/space/kind/README.md#sandbox-namespace-and-network-policy) lists each rule's source.
 
 ## Lifecycle and persistence
 
@@ -209,6 +209,18 @@ another execution or retarget a replacement generation. The reset is sent once:
 an ambiguous transport failure does not establish that repeating a clock reset
 is safe.
 
+### Native files on the data plane
+
+The data plane can also answer Native `files:*` requests (`SPACE_DATA_PLANE_NATIVE_FILES=serve`), under `/v1` and `/api/v1` as the API mounts them. A deployment routes those paths to it with its load balancer. The API keeps its own `files:*` routes, so any request that reaches it is still answered there. The data plane carries the request's bytes and the API makes every decision, through two RPCs on its activation listener ([native file access](../proto/node/api/v1/native_file_access.proto)):
+
+1. Before reading the body, the data plane asks the API to authorize the request from its headers. The API runs its public route's own credential check, owner scope and error rendering, so an unauthenticated request is refused before its body is read, and a refusal is answered byte for byte as the API rendered it.
+2. With upload admission on, a `files:write` or `files:write_batch` then reserves its declared `Content-Length` from the data plane's Native upload budgets before its body is read.
+3. The data plane reads and checks the body with the same rules as the API's handler. For write, write_batch, mkdir, remove and rename it computes the request's fingerprint.
+4. It asks the API to prepare the call. The API binds the `Idempotency-Key` to the fingerprint, refusing a different request under it with 409 `idempotency_conflict`, runs the drain gate and the admission charge, and wakes the sandbox if its policy allows. It answers with the runtime to call and a route token.
+5. The data plane calls the sandbox's runtime directly and maps a failure as the API does.
+
+Nothing is cached between calls, so a revoked credential is refused on its next request. A key bound through either server binds the same record, so a retry may land on either. A data-plane replica that is draining answers new files requests with the Native 503 `service_unavailable` and lets the ones it took finish. A request it took may wait up to 135 s for its sandbox to wake and then transfer its body, so size its drain deadline and the load balancer's deregistration delay to cover both. If the API cannot be reached, or predates these RPCs, the data plane answers a retryable 503.
+
 ## Service responsibilities
 
 | Component | Responsibility |
@@ -216,7 +228,7 @@ is safe.
 | API and PostgreSQL | Authenticate and authorize requests; store control-plane records and desired state. |
 | Controllers and adapters | Coordinate sandbox lifecycle changes with worker services. In Kind, the Kubernetes adapter, cluster controller, and runtime shim create and manage sandbox pods. |
 | Worker services | Manage VMs, networking, volumes, templates, and credentials. btrfs copy-on-write supports root filesystem creation. |
-| Data plane | Connect clients to guest processes and forward events using scoped tokens. |
+| Data plane | Connect clients to guest processes and forward events using scoped tokens. Optionally carry Native `files:*` requests that the API authorizes and prepares. |
 | Builders and object storage | Build templates separately from user sandboxes and store template and snapshot artifacts. The Kind deployment uses Versity S3 Gateway (versitygw). |
 | Internal API and UI | Receive node state publication and template-release publication, and provide a browser interface. API clients do not require the UI. |
 
@@ -249,7 +261,7 @@ SPACE_RUN_CONTAINMENT_BENCHMARK=1 cargo test -p pplx-space-node-mgr --lib \
 
 Firecracker isolates guest execution. Host-side services still require privileges to manage VMs, storage, and networking.
 
-The API authorizes management requests with a user-session or service bearer token. The data plane authorizes command connections with session-scoped attachment tokens. Management and attachment tokens are not interchangeable.
+The API authorizes management requests with a user-session or service bearer token. The data plane authorizes command connections with session-scoped attachment tokens. Management and attachment tokens are not interchangeable. A Native `files:*` request that reaches the data plane carries a management token, which the data plane passes to the API to authorize; it never decides one itself.
 
 A data-plane replica that receives SIGTERM drains rather than dropping its
 streams. The listener closes, so new connections, readiness probes included,
