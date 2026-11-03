@@ -443,4 +443,4 @@ impl RuntimeUpgradeEffects for NodeRuntimeUpgradeEffects {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::service::runtime_upgrade) mod tests;

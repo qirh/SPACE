@@ -1251,11 +1251,45 @@ impl SandboxManagerService {
     /// leave its row suspended without launching anything. A Wake that runs a
     /// runtime upgrade boots the staged disk by cold start instead of loading
     /// the checkpoint, which may belong to a runtime that must not execute.
-    /// A sandbox already on this node, in any state, is left to the upgrade,
-    /// which checks its checkpoint against the one it was decided from.
+    /// A stage interrupted after adopting the row is resumed. A sandbox
+    /// already on this node in any other state is left to the upgrade, which
+    /// checks its checkpoint against the one it was decided from.
     pub(super) async fn stage_missing_checkpoint(&self, req: StartRequest) -> Result<(), Status> {
         let mut start_ctx = StartSandboxContext::from_request(&req)?;
         match self.resolve_start_sandbox_target(&req.sandbox_id, &start_ctx, false)? {
+            // A stage interrupted after adopting the row: finish it, as a
+            // restore's retry would, and still launch nothing.
+            StartSandboxTarget::Local(lookup)
+                if lookup.sandbox.state == SandboxState::Restoring =>
+            {
+                let sandbox_id = lookup.sandbox.id.clone();
+                let artifact_lock = self.auto_lifecycle.artifact_lock(&sandbox_id);
+                let _artifact_guard =
+                    wait_for_activation_admission(&sandbox_id, artifact_lock.lock()).await?;
+                self.refuse_unretired_runtime_upgrade(&sandbox_id)?;
+                let staging_lock = self.auto_lifecycle.staging_lock(&sandbox_id);
+                if staging_lock.try_lock().is_err() {
+                    return Err(Status::unavailable(format!(
+                        "sandbox {sandbox_id} restore staging is in progress; retry"
+                    )));
+                }
+                let sandbox = self.lookup_sandbox(&sandbox_id)?;
+                let runtime_live = (self.sandbox_runtime_live)(&sandbox.id);
+                match checkpoint_restore_retry_action(&sandbox, SandboxState::Started, runtime_live)
+                {
+                    CheckpointRestoreRetryAction::ResumeRestoring => {
+                        Box::pin(self.resume_interrupted_stage(&sandbox, &mut start_ctx))
+                            .await
+                            .map(drop)
+                    }
+                    // Only a restore's own retry retires one with runtime,
+                    // pin or cleanup evidence; an upgrade never boots it.
+                    _ => Err(Status::failed_precondition(format!(
+                        "sandbox {sandbox_id} holds an interrupted restore that must be retired \
+                         before it can be upgraded"
+                    ))),
+                }
+            }
             // Another activation created the row since the caller looked.
             StartSandboxTarget::Local(_) => Ok(()),
             StartSandboxTarget::MissingCheckpointRestore { sandbox_id } => self
@@ -1267,6 +1301,66 @@ impl SandboxManagerService {
                 .await
                 .map(drop),
         }
+    }
+
+    /// Resume a retryable cross-node restore that adopted its row and was
+    /// interrupted before finalizing it, leaving the row `restoring`. The
+    /// caller holds the sandbox's artifact lock and has peeked its staging
+    /// lock. Returns where the stage came from; launches nothing.
+    async fn resume_interrupted_stage(
+        &self,
+        sandbox: &crate::db::SandboxRow,
+        ctx: &mut StartSandboxContext,
+    ) -> Result<super::recovery_cross_node::CrossNodeRestoreProvenance, Status> {
+        self.resolve_start_context_route_identity(sandbox, ctx)?;
+        let provenance = start_stage(
+            "restore.cross_node.retry_stage",
+            &sandbox.id,
+            self.run_cross_node_restore(CrossNodeRestoreRequest {
+                sandbox_id: &sandbox.id,
+                storage_uri: ctx.suspend_restore_storage_uri.as_deref(),
+                execution_generation: ctx.execution_generation,
+                activation_attempt_id: ctx.space_api_route_identity.activation_attempt_id,
+                recovery: None,
+                restore_artifact_as_new: ctx.restore_artifact_as_new.as_ref(),
+                target: ctx.restore_target,
+                // Zero, not the orphan path's budget: the caller already
+                // peeked the staging lock non-blockingly and answered
+                // `unavailable`, so waiting here would add a stall the caller
+                // did not have before.
+                staging_admission: CrossNodeRestoreStagingAdmission::WaitAtMost(
+                    std::time::Duration::ZERO,
+                ),
+            }),
+        )
+        .await
+        .map_err(|error| match error {
+            crate::snapshot_restore::RestoreError::AdmissionRejected(status) => status,
+            error @ crate::snapshot_restore::RestoreError::RootfsPolicy(..) => {
+                Status::failed_precondition(error.to_string())
+            }
+            error @ crate::snapshot_restore::RestoreError::RestoreOperationBusy { .. } => {
+                Status::unavailable(error.to_string())
+            }
+            error @ crate::snapshot_restore::RestoreError::CanonicalRootConflict { .. } => {
+                Status::failed_precondition(error.to_string())
+            }
+            // A caller that named the wrong artifact cannot be helped by
+            // retrying: `UNAVAILABLE` would have it retry the same refused
+            // restore on every attempt, forever.
+            error if error.is_stopped_materialization_refusal() => {
+                Status::failed_precondition(error.to_string())
+            }
+            other => Status::unavailable(format!(
+                "resume interrupted cross-node restore staging failed: {other}"
+            )),
+        })?;
+        provenance.ok_or_else(|| {
+            Status::unavailable(format!(
+                "sandbox {} restore staging ownership changed; retry",
+                sandbox.id
+            ))
+        })
     }
 
     async fn restore_suspended_checkpoint_start(
@@ -1314,57 +1408,7 @@ impl SandboxManagerService {
             let runtime_live = (self.sandbox_runtime_live)(&sandbox.id);
             match checkpoint_restore_retry_action(&sandbox, target_state, runtime_live) {
                 CheckpointRestoreRetryAction::ResumeRestoring => {
-                    self.resolve_start_context_route_identity(&sandbox, ctx)?;
-                    let provenance = start_stage(
-                        "restore.cross_node.retry_stage",
-                        &sandbox.id,
-                        self.run_cross_node_restore(CrossNodeRestoreRequest {
-                            sandbox_id: &sandbox.id,
-                            storage_uri: ctx.suspend_restore_storage_uri.as_deref(),
-                            execution_generation: ctx.execution_generation,
-                            activation_attempt_id: ctx
-                                .space_api_route_identity
-                                .activation_attempt_id,
-                            recovery: None,
-                            restore_artifact_as_new: ctx.restore_artifact_as_new.as_ref(),
-                            target: ctx.restore_target,
-                            // Zero, not the orphan path's budget: this handler
-                            // already peeked the staging lock non-blockingly a few
-                            // lines up and answered `unavailable`, so waiting here
-                            // would add a stall the caller did not have before.
-                            staging_admission: CrossNodeRestoreStagingAdmission::WaitAtMost(
-                                std::time::Duration::ZERO,
-                            ),
-                        }),
-                    )
-                    .await
-                    .map_err(|error| match error {
-                        crate::snapshot_restore::RestoreError::AdmissionRejected(status) => status,
-                        error @ crate::snapshot_restore::RestoreError::RootfsPolicy(..) => {
-                            Status::failed_precondition(error.to_string())
-                        }
-                        error @ crate::snapshot_restore::RestoreError::RestoreOperationBusy {
-                            ..
-                        } => Status::unavailable(error.to_string()),
-                        error @ crate::snapshot_restore::RestoreError::CanonicalRootConflict {
-                            ..
-                        } => Status::failed_precondition(error.to_string()),
-                        // A caller that named the wrong artifact cannot be
-                        // helped by retrying: `UNAVAILABLE` would have it retry
-                        // the same refused restore on every attempt, forever.
-                        error if error.is_stopped_materialization_refusal() => {
-                            Status::failed_precondition(error.to_string())
-                        }
-                        other => Status::unavailable(format!(
-                            "resume interrupted cross-node restore staging failed: {other}"
-                        )),
-                    })?;
-                    let provenance = provenance.ok_or_else(|| {
-                        Status::unavailable(format!(
-                            "sandbox {} restore staging ownership changed; retry",
-                            sandbox.id
-                        ))
-                    })?;
+                    let provenance = self.resume_interrupted_stage(&sandbox, ctx).await?;
                     restored_snapshot.storage_uri = Some(provenance.storage_uri);
                     restored_snapshot.local_artifact_id = provenance.local_artifact_id;
                     remote_stage_completed = true;

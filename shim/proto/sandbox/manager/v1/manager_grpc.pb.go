@@ -47,6 +47,7 @@ const (
 	SandboxManager_EnqueueArtifactBackup_FullMethodName                  = "/space.sandbox.manager.v1.SandboxManager/EnqueueArtifactBackup"
 	SandboxManager_EvictClusterDeletedSandbox_FullMethodName             = "/space.sandbox.manager.v1.SandboxManager/EvictClusterDeletedSandbox"
 	SandboxManager_UpgradeRuntime_FullMethodName                         = "/space.sandbox.manager.v1.SandboxManager/UpgradeRuntime"
+	SandboxManager_GetRuntimeUpgrade_FullMethodName                      = "/space.sandbox.manager.v1.SandboxManager/GetRuntimeUpgrade"
 	SandboxManager_EnableSnapshots_FullMethodName                        = "/space.sandbox.manager.v1.SandboxManager/EnableSnapshots"
 	SandboxManager_DisableSnapshots_FullMethodName                       = "/space.sandbox.manager.v1.SandboxManager/DisableSnapshots"
 	SandboxManager_ListSnapshots_FullMethodName                          = "/space.sandbox.manager.v1.SandboxManager/ListSnapshots"
@@ -190,6 +191,11 @@ type SandboxManagerClient interface {
 	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
 	// upgrade leaves no row behind, so a retry after it starts over.
 	UpgradeRuntime(ctx context.Context, in *UpgradeRuntimeRequest, opts ...grpc.CallOption) (*UpgradeRuntimeResponse, error)
+	// Internal-only, read-only: where one `UpgradeRuntime` operation stands on
+	// this node, for a caller that can't see its response. A Kubernetes pod's
+	// shim runs the upgrade at container create, so the control plane reads the
+	// outcome here.
+	GetRuntimeUpgrade(ctx context.Context, in *GetRuntimeUpgradeRequest, opts ...grpc.CallOption) (*GetRuntimeUpgradeResponse, error)
 	// Enable rolling btrfs snapshots for a sandbox.
 	EnableSnapshots(ctx context.Context, in *EnableSnapshotsRequest, opts ...grpc.CallOption) (*EnableSnapshotsResponse, error)
 	// Disable rolling btrfs snapshots for a sandbox.
@@ -581,6 +587,16 @@ func (c *sandboxManagerClient) UpgradeRuntime(ctx context.Context, in *UpgradeRu
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UpgradeRuntimeResponse)
 	err := c.cc.Invoke(ctx, SandboxManager_UpgradeRuntime_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sandboxManagerClient) GetRuntimeUpgrade(ctx context.Context, in *GetRuntimeUpgradeRequest, opts ...grpc.CallOption) (*GetRuntimeUpgradeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRuntimeUpgradeResponse)
+	err := c.cc.Invoke(ctx, SandboxManager_GetRuntimeUpgrade_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1289,6 +1305,11 @@ type SandboxManagerServer interface {
 	// `operation_id`: a retry resumes or settles the same upgrade. A rolled-back
 	// upgrade leaves no row behind, so a retry after it starts over.
 	UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error)
+	// Internal-only, read-only: where one `UpgradeRuntime` operation stands on
+	// this node, for a caller that can't see its response. A Kubernetes pod's
+	// shim runs the upgrade at container create, so the control plane reads the
+	// outcome here.
+	GetRuntimeUpgrade(context.Context, *GetRuntimeUpgradeRequest) (*GetRuntimeUpgradeResponse, error)
 	// Enable rolling btrfs snapshots for a sandbox.
 	EnableSnapshots(context.Context, *EnableSnapshotsRequest) (*EnableSnapshotsResponse, error)
 	// Disable rolling btrfs snapshots for a sandbox.
@@ -1494,6 +1515,9 @@ func (UnimplementedSandboxManagerServer) EvictClusterDeletedSandbox(context.Cont
 }
 func (UnimplementedSandboxManagerServer) UpgradeRuntime(context.Context, *UpgradeRuntimeRequest) (*UpgradeRuntimeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpgradeRuntime not implemented")
+}
+func (UnimplementedSandboxManagerServer) GetRuntimeUpgrade(context.Context, *GetRuntimeUpgradeRequest) (*GetRuntimeUpgradeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRuntimeUpgrade not implemented")
 }
 func (UnimplementedSandboxManagerServer) EnableSnapshots(context.Context, *EnableSnapshotsRequest) (*EnableSnapshotsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnableSnapshots not implemented")
@@ -2135,6 +2159,24 @@ func _SandboxManager_UpgradeRuntime_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SandboxManagerServer).UpgradeRuntime(ctx, req.(*UpgradeRuntimeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SandboxManager_GetRuntimeUpgrade_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRuntimeUpgradeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SandboxManagerServer).GetRuntimeUpgrade(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SandboxManager_GetRuntimeUpgrade_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SandboxManagerServer).GetRuntimeUpgrade(ctx, req.(*GetRuntimeUpgradeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3124,6 +3166,10 @@ var SandboxManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UpgradeRuntime",
 			Handler:    _SandboxManager_UpgradeRuntime_Handler,
+		},
+		{
+			MethodName: "GetRuntimeUpgrade",
+			Handler:    _SandboxManager_GetRuntimeUpgrade_Handler,
 		},
 		{
 			MethodName: "EnableSnapshots",

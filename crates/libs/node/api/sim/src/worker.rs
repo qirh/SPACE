@@ -1891,6 +1891,15 @@ impl SimWorkerApiInternalService {
 
 #[tonic::async_trait]
 impl WorkerApiInternal for SimWorkerApiInternalService {
+    async fn get_runtime_upgrade(
+        &self,
+        _request: Request<sbx::GetRuntimeUpgradeRequest>,
+    ) -> Result<Response<sbx::GetRuntimeUpgradeResponse>, Status> {
+        Err(Status::unimplemented(
+            "the simulator runs no runtime upgrades",
+        ))
+    }
+
     async fn adopt_pool_sandbox(
         &self,
         request: Request<sbx::AdoptPoolSandboxRequest>,

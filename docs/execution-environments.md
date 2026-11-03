@@ -1258,7 +1258,9 @@ blocking cold `Start` to run, and whether the sandbox ends started or stopped.
 
 A retry with the same operation id resumes from the row: an interrupted upgrade
 rolls back and starts again, and a verified one finishes its retirement. A
-rolled-back upgrade leaves no row, so a retry after it starts over. An upgrade
+rolled-back upgrade leaves no row, so a retry after it starts over. Its failure
+stays in `sandbox_runtime_upgrade_outcomes`, as does an upgrade that found the
+sandbox already on its target, for `GetRuntimeUpgrade` below. An upgrade
 that must end stopped leaves the sandbox as it finds it if the sandbox stopped,
 suspended or started another execution first. A
 sandbox-manager recovery loop settles unfinished upgrades at startup and every
@@ -1268,6 +1270,70 @@ stopped stays verified while its sandbox runs, until its caller's retry stops it
 or the sandbox stops some other way. Deleting the sandbox deletes its
 upgrade rows; evicting it removes the preserved copy with the rest of its local
 presence, and the upgrade fails at its next claim.
+
+### Booting an upgrade in its pod
+
+On Kubernetes a sandbox's microVM launches in its pod's containerd shim at
+container create, never from a Wake, so an upgrade has to boot there too. A
+Wake carrying `runtime_upgrade` is refused with `FailedPrecondition`, before
+anything is staged, fenced or booted, when its route identity or the
+sandbox's local row names a Kubernetes pod; Direct keeps its Wake path. The pod carries the upgrade instead, and this is the node
+half of that: the api doesn't render it yet.
+
+- **Pod.** A restore pod's `space.pplx.net/checkpoint` is `runtime-upgrade`,
+  and `space.pplx.net/runtime-upgrade-*` annotations carry the operation id,
+  the target environment, the authorization's id, reason and memory-loss
+  consent, the target state (`started` or `stopped`), and for a suspended
+  source the local artifact of the checkpoint the upgrade was decided from
+  (`PodRuntimeUpgrade` in `crates/libs/common/core/src/k8s/runtime_upgrade.rs`).
+  The restore's storage URI and source node stay where they are.
+- **Shim.** The shim builds the `Start` it would send, with the pod's
+  namespace and route identity, as the blocking cold start the upgrade boots,
+  and calls `UpgradeRuntime` with it. For a suspended source the storage URI
+  and source node become `stage_from`. Any error fails the create; the shim
+  never falls back to a `Start`, which would boot the environment the upgrade
+  moves off. A started target attaches the execution the response returns. A
+  stopped target runs a placeholder task with no microVM, the one a stopped
+  materialization runs, so `Kill` and `Delete` never ask sandbox-manager to
+  suspend or delete the stopped sandbox, and exec, pause, resume and
+  checkpoint are refused.
+- **`UpgradeRuntime`.** Under the sandbox's upgrade lock, a suspended sandbox
+  absent from the node is staged from `stage_from` and left suspended, never
+  launched; a stage interrupted after it adopted the row is resumed the same
+  way. A suspended sandbox is then upgraded only from the checkpoint
+  `checkpoint_local_artifact_id` names, which the upgrade checks for the RPC
+  and the Wake alike. For a started target the response always carries the
+  running execution. A sandbox already on the target is activated in place: a
+  stopped one cold-starts with the request's start and a suspended one
+  restores its checkpoint, so the pod needs no second RPC. An operation
+  tries that activation at most once: it's claimed durably before the start
+  runs, so a start that failed takes a new operation id. A sandbox already
+  started, a replay of
+  an upgrade that already finished, and a retry of an activation answer with
+  the live execution only when its route identity names the same pod (pod UID
+  and execution generation), and are refused with `FailedPrecondition`
+  otherwise. A replay never moves the sandbox, and a retry must name the
+  sandbox, target and authorization the operation's recorded outcome names,
+  as for a live row.
+- **`GetRuntimeUpgrade`.** The shim's response doesn't reach the control
+  plane, which reads the outcome from this read-only RPC instead: absent, in
+  progress (with its phase), upgraded, rolled back (with its failure) or
+  already on target. Node-api forwards it on `WorkerApiInternal` only for a
+  caller with the control-plane authority a policy write needs.
+
+Only the control plane writes sandbox pods, and the annotations are the
+upgrade's authorization: a principal that can create a sandbox pod can request
+an upgrade, including one that discards a suspended sandbox's memory. The
+node still refuses any move that isn't a certified edge from the environment
+the sandbox ran under. The shim calls sandbox-manager as root, which
+`UpgradeRuntime` allows.
+
+The shim and sandbox-manager ship before the api renders the pod. A shim that
+predates the checkpoint passes `runtime-upgrade` through as a `Start`
+checkpoint, which sandbox-manager refuses for a local row in any state and for
+a sandbox absent from the node, so the pod fails without booting anything. A
+sandbox-manager that predates activation answers `ALREADY_ON_TARGET` with no
+execution, and the shim fails the create.
 
 ### Upgrading at resume and start
 
@@ -1348,7 +1414,11 @@ populate it, every move off an environment that may not execute is stranded.
    normally, where its execution policy refuses a runtime that may not run.
    Node-api serves Wake only on `WorkerApiInternal`, and forwards
    `runtime_upgrade` only for a caller with the control-plane authority a
-   policy write needs.
+   policy write needs. A Kubernetes sandbox launches in its pod's shim,
+   though, which never sees this Wake, so sandbox-manager now refuses the
+   field for a Kubernetes route identity (see "Booting an upgrade in its
+   pod"), and with the flag on these activations fail until the api moves
+   them onto the pod.
    A suspended sandbox's checkpoint on the node is booted only if it's the
    one the upgrade was decided from: the Wake names that checkpoint's local
    artifact, and the row must pin it, as it does on the checkpoint's source

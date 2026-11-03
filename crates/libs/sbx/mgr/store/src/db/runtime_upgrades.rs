@@ -174,6 +174,19 @@ pub struct RuntimeUpgradeRecord {
     pub failure: Option<String>,
 }
 
+impl RuntimeUpgradeRecord {
+    /// What the operation that wrote this row asked for.
+    pub fn identity(&self) -> RuntimeUpgradeRequestIdentity {
+        RuntimeUpgradeRequestIdentity {
+            operation_id: self.operation_id,
+            sandbox_id: self.sandbox_id.clone(),
+            target_environment: self.target_environment,
+            target_state: self.target_state,
+            authorization_id: self.authorization.id.clone(),
+        }
+    }
+}
+
 pub struct NewRuntimeUpgrade<'a> {
     pub operation_id: RuntimeUpgradeOperationId,
     pub sandbox_id: &'a str,
@@ -632,18 +645,253 @@ pub(super) fn verify_booting_runtime_upgrade(conn: &Connection, sandbox_id: &str
     Ok(())
 }
 
-/// Delete a `rolled_back` row once its preserved disk is gone.
+/// Delete a `rolled_back` row once its preserved disk is gone, keeping its
+/// failure as the operation's [`RecordedRuntimeUpgradeOutcome::RolledBack`] outcome.
 pub fn finish_runtime_upgrade_rollback(
     conn: &Connection,
     operation_id: RuntimeUpgradeOperationId,
 ) -> Result<bool> {
-    let changed = conn.execute(
+    let tx = immediate_transaction(conn)?;
+    tx.execute(
+        "INSERT INTO sandbox_runtime_upgrade_outcomes (
+             operation_id, sandbox_id, outcome, target_environment, target_state,
+             authorization_id, failure, recorded_at
+         )
+         SELECT operation_id, sandbox_id, ?2, target_environment, target_state,
+                authorization_id, failure, ?3
+           FROM sandbox_runtime_upgrades
+          WHERE operation_id = ?1
+            AND phase = 'rolled_back'
+         ON CONFLICT (operation_id) DO UPDATE
+            SET outcome = excluded.outcome,
+                failure = excluded.failure,
+                recorded_at = excluded.recorded_at",
+        params![
+            operation_id.to_string(),
+            RecordedRuntimeUpgradeOutcome::RolledBack.as_str(),
+            now()?
+        ],
+    )?;
+    let changed = tx.execute(
         "DELETE FROM sandbox_runtime_upgrades
           WHERE operation_id = ?1
             AND phase = 'rolled_back'",
         params![operation_id.to_string()],
     )?;
+    if changed != 1 {
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// What one upgrade operation asks for. A retry under the same operation
+/// must ask for the same, whatever the node recorded of it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpgradeRequestIdentity {
+    pub operation_id: RuntimeUpgradeOperationId,
+    pub sandbox_id: String,
+    pub target_environment: EnvironmentReference,
+    pub target_state: RuntimeUpgradeTargetState,
+    pub authorization_id: String,
+}
+
+/// Record that the operation `request` names found its sandbox already on
+/// its target and fenced nothing. A record of the same operation for another
+/// sandbox is left as it is.
+pub fn record_runtime_upgrade_already_on_target(
+    conn: &Connection,
+    request: &RuntimeUpgradeRequestIdentity,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sandbox_runtime_upgrade_outcomes (
+             operation_id, sandbox_id, outcome, target_environment, target_state,
+             authorization_id, failure, recorded_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)
+         ON CONFLICT (operation_id) DO UPDATE
+            SET outcome = excluded.outcome,
+                failure = NULL,
+                recorded_at = excluded.recorded_at
+          WHERE sandbox_id = excluded.sandbox_id",
+        params![
+            request.operation_id.to_string(),
+            request.sandbox_id,
+            RecordedRuntimeUpgradeOutcome::AlreadyOnTarget.as_str(),
+            request.target_environment.to_string(),
+            request.target_state.as_str(),
+            request.authorization_id,
+            now()?
+        ],
+    )?;
+    Ok(())
+}
+
+db_private_outside_tests! {
+    /// What the operation a recorded outcome belongs to asked for, `None`
+    /// without a recorded outcome.
+    fn recorded_runtime_upgrade_request(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+    ) -> Result<Option<RuntimeUpgradeRequestIdentity>> {
+        let row: Option<(String, String, String, String)> = conn
+            .query_row(
+                "SELECT sandbox_id, target_environment, target_state, authorization_id
+                   FROM sandbox_runtime_upgrade_outcomes
+                  WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(sandbox_id, target_environment, target_state, authorization_id)| {
+            Ok(RuntimeUpgradeRequestIdentity {
+                operation_id,
+                sandbox_id,
+                target_environment: target_environment
+                    .parse()
+                    .map_err(|error| conversion_error(1, Type::Text, error))?,
+                target_state: target_state
+                    .parse()
+                    .map_err(|error| conversion_error(2, Type::Text, error))?,
+                authorization_id,
+            })
+        })
+        .transpose()
+    }
+}
+
+/// Claim the start of `sandbox_id` for its already-on-target upgrade, before
+/// the start runs, so the operation starts it at most once. False when no
+/// such outcome is recorded.
+pub fn claim_runtime_upgrade_activation(
+    conn: &Connection,
+    operation_id: RuntimeUpgradeOperationId,
+    sandbox_id: &str,
+) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE sandbox_runtime_upgrade_outcomes
+            SET activation_claimed_at = ?3
+          WHERE operation_id = ?1
+            AND sandbox_id = ?2
+            AND outcome = ?4",
+        params![
+            operation_id.to_string(),
+            sandbox_id,
+            now()?,
+            RecordedRuntimeUpgradeOutcome::AlreadyOnTarget.as_str()
+        ],
+    )?;
     Ok(changed == 1)
+}
+
+/// The outcome of an upgrade that left no row in `sandbox_runtime_upgrades`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordedRuntimeUpgradeOutcome {
+    /// The old pair was restored and the preserved disk deleted.
+    RolledBack,
+    /// The sandbox was already on the target; nothing was fenced or booted.
+    AlreadyOnTarget,
+}
+
+impl RecordedRuntimeUpgradeOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RolledBack => "rolled_back",
+            Self::AlreadyOnTarget => "already_on_target",
+        }
+    }
+}
+
+impl fmt::Display for RecordedRuntimeUpgradeOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unknown runtime upgrade outcome {0:?}")]
+pub struct RecordedRuntimeUpgradeOutcomeParseError(String);
+
+impl FromStr for RecordedRuntimeUpgradeOutcome {
+    type Err = RecordedRuntimeUpgradeOutcomeParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "rolled_back" => Ok(Self::RolledBack),
+            "already_on_target" => Ok(Self::AlreadyOnTarget),
+            other => Err(RecordedRuntimeUpgradeOutcomeParseError(other.to_string())),
+        }
+    }
+}
+
+/// Where one upgrade stands on this node, for a caller that may have lost the
+/// `UpgradeRuntime` response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeUpgradeReport {
+    pub sandbox_id: String,
+    pub status: RuntimeUpgradeStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeUpgradeStatus {
+    /// The upgrade still owes work: it fences the sandbox, or its verified
+    /// boot hasn't retired the old checkpoint yet.
+    InProgress(RuntimeUpgradePhase),
+    /// The sandbox booted under the target and the old checkpoint is retired.
+    Upgraded,
+    /// The old pair is back. The preserved copy may still await deletion.
+    RolledBack { failure: Option<String> },
+    /// Nothing was fenced or booted. `activation_claimed` once the upgrade
+    /// claimed the start of the sandbox for a started target; the start may
+    /// have failed since, and is never tried again.
+    AlreadyOnTarget { activation_claimed: bool },
+}
+
+db_private_outside_tests! {
+    /// The report for `operation_id`, `None` when the node holds no record of
+    /// it. The live row, when there is one, wins over a recorded outcome: a
+    /// retry after a rollback starts over under the same operation.
+    fn runtime_upgrade_report(
+        conn: &Connection,
+        operation_id: RuntimeUpgradeOperationId,
+    ) -> Result<Option<RuntimeUpgradeReport>> {
+        if let Some(record) = runtime_upgrade(conn, operation_id)? {
+            let status = match record.phase {
+                RuntimeUpgradePhase::Retired => RuntimeUpgradeStatus::Upgraded,
+                RuntimeUpgradePhase::RolledBack => RuntimeUpgradeStatus::RolledBack {
+                    failure: record.failure,
+                },
+                phase => RuntimeUpgradeStatus::InProgress(phase),
+            };
+            return Ok(Some(RuntimeUpgradeReport {
+                sandbox_id: record.sandbox_id,
+                status,
+            }));
+        }
+        let row: Option<(String, String, Option<String>, Option<String>)> = conn
+            .query_row(
+                "SELECT sandbox_id, outcome, failure, activation_claimed_at
+                   FROM sandbox_runtime_upgrade_outcomes
+                  WHERE operation_id = ?1",
+                params![operation_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(sandbox_id, outcome, failure, activation_claimed_at)| {
+            let status = match outcome
+                .parse()
+                .map_err(|error| conversion_error(1, Type::Text, error))?
+            {
+                RecordedRuntimeUpgradeOutcome::RolledBack => RuntimeUpgradeStatus::RolledBack { failure },
+                RecordedRuntimeUpgradeOutcome::AlreadyOnTarget => {
+                    RuntimeUpgradeStatus::AlreadyOnTarget {
+                        activation_claimed: activation_claimed_at.is_some(),
+                    }
+                }
+            };
+            Ok(RuntimeUpgradeReport { sandbox_id, status })
+        })
+        .transpose()
+    }
 }
 
 #[cfg(test)]
