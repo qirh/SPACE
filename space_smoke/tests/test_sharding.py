@@ -23,8 +23,9 @@ def _inventory(surface):
     }
 
 
-# Twelve, CI's count, leave the brownout's shard with no native scenario.
-@pytest.mark.parametrize("count", [4, 8, 12])
+# Twelve is CI's count. Thirteen leave a shard with no native scenario, so a
+# pass with nothing to run is exercised too.
+@pytest.mark.parametrize("count", [4, 8, 12, 13])
 def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
     """Each (surface, scenario) pair of a sharded run runs on exactly one shard."""
 
@@ -73,8 +74,8 @@ def test_shards_run_every_eligible_scenario_once_and_propagate_failures(count):
     expected = {(surface, sid) for surface in ("ecw", "native") for sid in _inventory(surface)}
     assert len(seen) == len(expected)
     assert set(seen) == expected
-    if count == 12:
-        assert empty_passes, "twelve shards no longer exercise an empty pass"
+    if count == 13:
+        assert empty_passes, "thirteen shards no longer exercise an empty pass"
 
 
 @pytest.mark.parametrize("shard", ["0/2", "3/2", "1/0", "1", "a/2", "1/2/3"])
