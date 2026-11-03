@@ -4,8 +4,9 @@ internal-api delegates cold wakes to the api's IngressActivationApi listener
 ("Ingress activation delegation"). These checks render both charts and assert
 that the listener serves the CA-issued identity naming the Service internal-api
 dials, that internal-api dials it over https and presents a projected
-space-cluster-api token, and that the listener admits only internal-api by
-TokenReview without static fallback.
+space-cluster-api token, and that the listener admits only internal-api and
+the data plane, whose Native files routes call it too, by TokenReview without
+static fallback.
 """
 
 from urllib.parse import urlsplit
@@ -73,12 +74,14 @@ def test_the_listener_serves_an_identity_naming_the_dialled_service():
     assert leaves[0].strip('" ').split("|")[2] == "space-api"
 
 
-def test_the_listener_admits_only_internal_api_by_token_review():
+def test_the_listener_admits_only_its_callers_by_token_review():
     manifests = render(API_CHART, "space")
     env = env_by_name(object_named(manifests, "Deployment", "space-api"))
     assert env["SPACE_K8S_TOKEN_AUTH_ENABLED"]["value"] == "true"
     assert env["SPACE_K8S_TOKEN_AUTH_STATIC_FALLBACK_ENABLED"]["value"] == "false"
-    assert env["SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS"]["value"] == "space-internal-api"
+    assert env["SPACE_CLUSTER_API_AUTH_ALLOWED_SERVICE_ACCOUNTS"]["value"] == (
+        "space-internal-api,space-data-plane"
+    )
 
     binding = object_named(manifests, "ClusterRoleBinding", "space-api-token-review")
     assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "space-api", "namespace": "space"}]

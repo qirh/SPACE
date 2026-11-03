@@ -54,9 +54,18 @@ nodeApiTokenExpirationSeconds: 600
 shutdownGraceSeconds: 150
 
 # Native `files:*` (SPACE_DATA_PLANE_NATIVE_FILES); off leaves the routes
-# unmounted.
+# unmounted. On in Kind, where the smoke sends files calls to this origin
+# directly (127.0.0.1:8090, the entry NodePort below) as well as to the API's;
+# a deployment routes them here with its load balancer instead.
 nativeFiles:
-  enabled: false
+  enabled: true
+  # The API's activation listener, which decides each request
+  # (SPACE_INGRESS_ACTIVATION_ENDPOINT): the space-api Service's port 9801,
+  # whose TLS identity names that Service (space-api-local's deployment.yaml).
+  # The listener admits this release's ServiceAccount
+  # (ingressActivation.allowedServiceAccounts in space-api-local) with the
+  # projected space-cluster-api token below.
+  accessEndpoint: https://space-api:9801
   # How long a files request may still take once its sandbox is awake: the
   # largest write's or read's transfer. A request taken just before SIGTERM
   # can first wait up to 135 s for its sandbox to wake (the API's blocking

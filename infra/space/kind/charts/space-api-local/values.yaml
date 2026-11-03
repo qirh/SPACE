@@ -288,10 +288,14 @@ serviceAccount:
 nodeApiTokenExpirationSeconds: 600
 
 # ServiceAccounts the ingress activation listener admits: internal-api, the
-# only route resolver that delegates cold wakes (RemoteIngressActivation).
+# only route resolver that delegates cold wakes (RemoteIngressActivation), and
+# the data plane, whose Native files routes have the listener decide each
+# request (NativeFileAccessApi). The data plane's identity may call only those
+# two RPCs there (guest_bridge_method, crates/libs/common/svc/src/auth/k8s.rs).
 ingressActivation:
   allowedServiceAccounts:
     - space-internal-api
+    - space-data-plane
 
 resources:
   requests:

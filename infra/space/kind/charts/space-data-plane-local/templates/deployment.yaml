@@ -111,6 +111,16 @@ spec:
                   key: SPACE_INTERNAL_TOKEN
             - name: SPACE_ECW_HOSTS
               value: {{ .Values.ecwHosts | quote }}
+            {{- if .Values.nativeFiles.enabled }}
+            # Native files: each request is authorized and prepared by the
+            # API's activation listener over the internal RPC TLS above, with
+            # the cluster-api token; the sandbox call goes to the runtime it
+            # grants (values.yaml).
+            - name: SPACE_DATA_PLANE_NATIVE_FILES
+              value: serve
+            - name: SPACE_INGRESS_ACTIVATION_ENDPOINT
+              value: {{ .Values.nativeFiles.accessEndpoint | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}

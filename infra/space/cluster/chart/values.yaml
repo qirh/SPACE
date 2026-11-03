@@ -57,6 +57,11 @@ space-data-plane-local:
   entry:
     type: ClusterIP
   ecwHosts: ""
+  # Kind serves Native files from the data plane, which needs the sandbox
+  # namespace's policy to admit it and a load balancer rule to route the files
+  # paths to it. Off here, as it ships: space-api answers them.
+  nativeFiles:
+    enabled: false
 
 # Kind gives every node its own root-owned /space/vendor (stage_vendor in
 # kind/node/space-kind-node.sh); a caller's node brings its own, which may be
